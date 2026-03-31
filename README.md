@@ -258,7 +258,7 @@ Tsunami is an experimental research tool. Nothing here is financial advice. Past
 
 MIT License
 
-Copyright (c) 2026 Greg Schmidt
+Copyright (c) 2026 K. Fallon
 
 Permission is hereby granted, free of charge, to any person obtaining a copy...
 
