@@ -18,11 +18,15 @@ except ImportError:
 
 ATR_MULT        = 2.0
 ATR_WINDOW      = 14
-MAX_HOLD_DAYS   = 10    # fixed time stop
+MAX_HOLD_DAYS   = 10
 MIN_STAGE       = 3
-MIN_HOLD_DAYS   = 3     # min days before stage collapse exit
+MIN_HOLD_DAYS   = 3
 LONG_ONLY       = True
-MIN_ENERGY      = 1.0   # only enter if energy ratio is above this and rising
+MIN_ENERGY      = 1.0
+MIN_RIDGE       = 0.0   # min ridge sharpness to enter (0 = disabled)
+MAX_PHASE_VEL   = 0.0   # max phase velocity to enter (0 = disabled)
+MIN_RIDGE_DELTA = 0.0   # min ridge delta (0 = disabled)
+AVOID_MATURE_COLLAPSE = False  # skip entry when ridge > 6 AND delta < 0
 ENTRY_SIGNALS   = {"bullish_breakout_bias", "bearish_breakout_bias"}
 RISK_BANDS      = [(86,100,0.015),(76,85,0.010),(65,75,0.005),(0,64,0.005)]
 
@@ -196,7 +200,8 @@ def run_backtest(ticker, start, end, min_conviction=0, portfolio=50000.0):
         r = {"compression":fv(row["compression_ratio"]),"energy":fv(row["energy_ratio"]),
              "volume":fv(row["volume_ratio"]),"cwt_slope":fv(row["cwt_cycle_slope"]),
              "cwt_conc":fv(row["cwt_energy_concentration"]),"cwt_conc_3d":fv(row["cwt_conc_min_3"]),
-             "exc_reversal":int(bool(row["excursion_reversal"])),"stage":stage}
+             "exc_reversal":int(bool(row["excursion_reversal"])),"stage":stage,
+             "ridge_sharpness":fv(row.get("ridge_sharpness")),"phase_velocity":fv(row.get("phase_velocity"))}
         conv = conviction_score(r)
         if conv < min_conviction: continue
 
@@ -207,6 +212,28 @@ def run_backtest(ticker, start, end, min_conviction=0, portfolio=50000.0):
         if len(out) >= 4:
             energy_prev = fv(out.iloc[-4]["energy_ratio"])
             if energy_prev is not None and energy_now <= energy_prev: continue
+
+        # Ridge sharpness filter — skip if cycle is noisy (optional)
+        if MIN_RIDGE > 0:
+            ridge = fv(row.get("ridge_sharpness"))
+            if ridge is not None and ridge < MIN_RIDGE: continue
+
+        # Phase velocity filter — skip if cycle is erratic (optional)
+        if MAX_PHASE_VEL > 0:
+            pv = fv(row.get("phase_velocity"))
+            if pv is not None and pv > MAX_PHASE_VEL: continue
+
+        # Ridge delta filter — only enter if cycle is actively sharpening (optional)
+        if MIN_RIDGE_DELTA != 0:
+            rd = fv(row.get("ridge_delta"))
+            if rd is not None and rd < MIN_RIDGE_DELTA: continue
+
+        # Avoid mature collapse — skip when ridge is high AND falling (universal avoid)
+        if AVOID_MATURE_COLLAPSE:
+            ridge = fv(row.get("ridge_sharpness"))
+            rd    = fv(row.get("ridge_delta"))
+            if ridge is not None and rd is not None and ridge > 6.0 and rd < 0:
+                continue
 
         # Entry: next day open
         idx = date_to_idx.get(today)
@@ -249,7 +276,7 @@ def run_backtest(ticker, start, end, min_conviction=0, portfolio=50000.0):
     print(f"\n  → {len(trades)} trades completed")
     return trades
 
-def print_scorecard(trades, ticker, start, end, min_conviction, portfolio):
+def print_scorecard(trades, ticker, start, end, min_conviction, portfolio, label=""):
     if not trades:
         print("\n⚠️  No trades."); return
 
@@ -268,8 +295,9 @@ def print_scorecard(trades, ticker, start, end, min_conviction, portfolio):
     for t in closed:
         r = t.get("exit_reason","Unknown"); reasons[r] = reasons.get(r,0)+1
 
+    tag = f" [{label}]" if label else ""
     print("\n"+"═"*70)
-    print(f"  🌊 TSUNAMI TRADE SIMULATION — {ticker}")
+    print(f"  🌊 TSUNAMI TRADE SIMULATION — {ticker}{tag}")
     print(f"  {start} → {end} | Portfolio: ${portfolio:,.0f} | Min conviction: {min_conviction}")
     print("═"*70)
     print(f"\n  Total trades   : {len(closed)}")
@@ -303,6 +331,170 @@ def print_scorecard(trades, ticker, start, end, min_conviction, portfolio):
     print("\n"+"═"*70)
     print("  ✅ Simulation complete")
     print("═"*70)
+    return {"win_rate": win_rate, "profit_factor": pf, "total_pnl": total_pnl,
+            "mean_pct": sum(pnl_pcts)/len(pnl_pcts) if pnl_pcts else 0,
+            "n_trades": len(closed)}
+
+
+# -----------------------------------------------------------------------
+# DSR — Deflated Sharpe Ratio (Bailey & Lopez de Prado 2014)
+# -----------------------------------------------------------------------
+
+def calc_dsr(trades: list[dict], n_trials: int = 1) -> float | None:
+    """
+    Deflated Sharpe Ratio — adjusts observed Sharpe for the number of
+    strategy variants tested. Accounts for multiple testing bias.
+    DSR >= 0.95 is the institutional gate.
+
+    n_trials: number of parameter combinations tested (default 1 for single run,
+              9 for perturbation test)
+    """
+    closed = [t for t in trades if "pnl" in t]
+    if len(closed) < 5:
+        return None
+
+    rets = np.array([t["pnl_pct"] / 100 for t in closed])
+    n    = len(rets)
+    mu   = float(np.mean(rets))
+    sig  = float(np.std(rets, ddof=1))
+    if sig == 0:
+        return None
+
+    sr_obs = mu / sig * np.sqrt(252 / max(1, np.mean([t.get("days_held",5) for t in closed])))
+
+    # Expected maximum Sharpe under null (no skill) across n_trials
+    # Approximation: E[max SR] ≈ (1 - euler_gamma) * Z^-1(1 - 1/n_trials) + euler_gamma * Z^-1(1 - 1/(n_trials*e))
+    from scipy import stats
+    euler_gamma = 0.5772
+    if n_trials <= 1:
+        sr_benchmark = 0.0
+    else:
+        z1 = stats.norm.ppf(1 - 1/n_trials)
+        z2 = stats.norm.ppf(1 - 1/(n_trials * np.e))
+        sr_benchmark = (1 - euler_gamma) * z1 + euler_gamma * z2
+
+    # Adjust for skewness and kurtosis
+    skew = float(pd.Series(rets).skew()) if n > 3 else 0
+    kurt = float(pd.Series(rets).kurtosis()) if n > 3 else 0
+
+    sr_adj = sr_obs * np.sqrt((1 - skew*sr_obs + (kurt-1)/4 * sr_obs**2) / (n-1))
+
+    # DSR = P(SR_true > SR_benchmark)
+    dsr = float(stats.norm.cdf((sr_adj - sr_benchmark) / np.sqrt(1/n)))
+    return round(dsr, 4)
+
+
+# -----------------------------------------------------------------------
+# Perturbation stability test
+# -----------------------------------------------------------------------
+
+def run_perturbation_test(ticker: str, start: str, end: str,
+                          min_conviction: int, portfolio: float) -> dict:
+    """
+    Run 9 parameter combinations (3 ATR × 3 energy thresholds).
+    Reports how many are profitable — gate is 5/9.
+    """
+    global ATR_MULT, MIN_ENERGY
+
+    atr_variants    = [1.5, 2.0, 2.5]
+    energy_variants = [0.9, 1.0, 1.1]
+
+    print(f"\n  🔬 Perturbation Stability Test — {ticker}")
+    print(f"  Testing 9 parameter combinations (3 ATR × 3 energy threshold)")
+    print("  " + "─"*55)
+    print(f"  {'ATR':>6} {'Energy':>8} {'Trades':>7} {'Win%':>7} {'PF':>7} {'P&L':>10}  Pass")
+    print("  " + "─"*55)
+
+    orig_atr    = ATR_MULT
+    orig_energy = MIN_ENERGY
+    passes      = 0
+    results     = []
+
+    for atr_v in atr_variants:
+        for energy_v in energy_variants:
+            ATR_MULT   = atr_v
+            MIN_ENERGY = energy_v
+            try:
+                trades = run_backtest(ticker, start, end, min_conviction, portfolio)
+                closed = [t for t in trades if "pnl" in t]
+                if not closed:
+                    print(f"  {atr_v:>6.1f}× {energy_v:>8.1f} {'0':>7} {'—':>7} {'—':>7} {'—':>10}  ✗")
+                    results.append(False)
+                    continue
+                wins  = [t for t in closed if t["pnl"] > 0]
+                losses= [t for t in closed if t["pnl"] <= 0]
+                wr    = len(wins)/len(closed)*100
+                gw    = sum(t["pnl"] for t in wins) if wins else 0
+                gl    = abs(sum(t["pnl"] for t in losses)) if losses else 0
+                pf    = gw/gl if gl > 0 else float("inf")
+                pnl   = sum(t["pnl"] for t in closed)
+                passed= pnl > 0 and pf > 1.0
+                if passed: passes += 1
+                results.append(passed)
+                p_str = "✅" if passed else "✗"
+                pf_str= f"{pf:.2f}" if pf != float("inf") else "∞"
+                print(f"  {atr_v:>6.1f}× {energy_v:>8.1f} {len(closed):>7} {wr:>6.1f}% {pf_str:>7} {pnl:>+10.0f}  {p_str}")
+            except Exception as e:
+                print(f"  {atr_v:>6.1f}× {energy_v:>8.1f}  ERROR: {e}")
+                results.append(False)
+
+    # Restore originals
+    ATR_MULT   = orig_atr
+    MIN_ENERGY = orig_energy
+
+    gate_pass = passes >= 5
+    print(f"\n  Passed: {passes}/9  |  Gate (5/9): {'✅ PASS' if gate_pass else '❌ FAIL'}")
+    return {"passes": passes, "total": 9, "gate": gate_pass, "results": results}
+
+
+# -----------------------------------------------------------------------
+# OOS comparison summary
+# -----------------------------------------------------------------------
+
+def print_oos_comparison(is_result: dict, oos_result: dict, ticker: str, oos_split: str) -> None:
+    """Print a clean IS vs OOS comparison table."""
+    print("\n" + "═"*70)
+    print(f"  🔬 WALK-FORWARD OOS ANALYSIS — {ticker}")
+    print(f"  OOS split: {oos_split}  (IS = before, OOS = after)")
+    print("═"*70)
+
+    metrics = [
+        ("Trades",       f"{is_result['n_trades']}",               f"{oos_result['n_trades']}"),
+        ("Win Rate",     f"{is_result['win_rate']:.1f}%",          f"{oos_result['win_rate']:.1f}%"),
+        ("Profit Factor",f"{is_result['profit_factor']:.2f}",      f"{oos_result['profit_factor']:.2f}"),
+        ("Total P&L",    f"${is_result['total_pnl']:+,.2f}",       f"${oos_result['total_pnl']:+,.2f}"),
+        ("Mean Return",  f"{is_result['mean_pct']:+.2f}%",         f"{oos_result['mean_pct']:+.2f}%"),
+    ]
+
+    if "dsr" in is_result:
+        metrics.append(("DSR",  f"{is_result['dsr']:.4f}" if is_result['dsr'] else "—",
+                                 f"{oos_result['dsr']:.4f}" if oos_result.get('dsr') else "—"))
+
+    print(f"\n  {'Metric':20} {'IN-SAMPLE (IS)':>20} {'OUT-OF-SAMPLE (OOS)':>20}")
+    print("  " + "─"*62)
+    for metric, is_val, oos_val in metrics:
+        print(f"  {metric:20} {is_val:>20} {oos_val:>20}")
+
+    # Verdict
+    print("\n  ── Verdict ──")
+    oos_pf  = oos_result["profit_factor"]
+    is_pf   = is_result["profit_factor"]
+    oos_pnl = oos_result["total_pnl"]
+
+    if oos_pf >= 1.5 and oos_pnl > 0:
+        verdict = "✅ STRONG — OOS edge confirmed. Profit factor holds out-of-sample."
+    elif oos_pf >= 1.0 and oos_pnl > 0:
+        verdict = "⚠️  MARGINAL — OOS profitable but weaker than IS. Monitor closely."
+    elif oos_pnl > 0:
+        verdict = "⚠️  WEAK — OOS profitable but profit factor < 1. May be noise."
+    else:
+        verdict = "❌ FAILED — OOS not profitable. IS results likely overfitted."
+
+    ratio = oos_pf / is_pf if is_pf > 0 else 0
+    print(f"  {verdict}")
+    print(f"  OOS/IS profit factor ratio: {ratio:.2f}  (>0.5 = acceptable degradation)")
+    print("═"*70)
+
 
 def main():
     parser = argparse.ArgumentParser(description="🌊 Tsunami Trade Simulator")
@@ -311,12 +503,79 @@ def main():
     parser.add_argument("--end",            required=True)
     parser.add_argument("--min-conviction", type=int,   default=0)
     parser.add_argument("--portfolio",      type=float, default=50000.0)
+    parser.add_argument("--oos-split",      type=str,   default=None,
+                        help="Date to split IS/OOS e.g. 2024-01-01")
+    parser.add_argument("--perturbation",   action="store_true")
+    parser.add_argument("--dsr",            action="store_true")
+    parser.add_argument("--min-ridge",       type=float, default=0.0,
+                        help="Minimum ridge sharpness to enter. 0 = disabled.")
+    parser.add_argument("--max-phase-vel",   type=float, default=0.0,
+                        help="Maximum phase velocity to enter. 0 = disabled.")
+    parser.add_argument("--min-ridge-delta",       type=float, default=0.0,
+                        help="Minimum ridge delta to enter. 0 = disabled.")
+    parser.add_argument("--avoid-mature-collapse", action="store_true",
+                        help="Skip entry when ridge > 6 AND delta < 0 (mature cycle collapsing).")
+    parser.add_argument("--max-hold",              type=int,   default=0,
+                        help="Override time stop in days. 0 = use default (10).")
     args = parser.parse_args()
+    ticker = args.ticker.upper()
 
-    trades = run_backtest(args.ticker.upper(), args.start, args.end,
-                          args.min_conviction, args.portfolio)
-    print_scorecard(trades, args.ticker.upper(), args.start, args.end,
-                    args.min_conviction, args.portfolio)
+    # Apply optional filters
+    global MIN_RIDGE, MAX_PHASE_VEL, MAX_HOLD_DAYS, MIN_RIDGE_DELTA, AVOID_MATURE_COLLAPSE
+    MIN_RIDGE             = args.min_ridge
+    MAX_PHASE_VEL         = args.max_phase_vel
+    MIN_RIDGE_DELTA       = args.min_ridge_delta
+    AVOID_MATURE_COLLAPSE = args.avoid_mature_collapse
+    if args.max_hold > 0:
+        MAX_HOLD_DAYS = args.max_hold
+
+    if args.oos_split:
+        # ── Walk-forward OOS mode ──
+        print(f"\n🔬 Walk-Forward OOS Test: {ticker}")
+        print(f"   IS:  {args.start} → {args.oos_split}")
+        print(f"   OOS: {args.oos_split} → {args.end}")
+
+        print(f"\n{'─'*70}")
+        print(f"  Phase 1: IN-SAMPLE training period")
+        is_trades = run_backtest(ticker, args.start, args.oos_split,
+                                 args.min_conviction, args.portfolio)
+        is_result = print_scorecard(is_trades, ticker, args.start, args.oos_split,
+                                    args.min_conviction, args.portfolio, label="IN-SAMPLE")
+        if is_result and args.dsr:
+            dsr = calc_dsr(is_trades, n_trials=9 if args.perturbation else 1)
+            is_result["dsr"] = dsr
+            print(f"\n  DSR (in-sample): {dsr:.4f}  {'✅ ≥0.95' if dsr and dsr>=0.95 else '⚠️  <0.95'}" if dsr else "\n  DSR: insufficient data")
+
+        print(f"\n{'─'*70}")
+        print(f"  Phase 2: OUT-OF-SAMPLE blind test (no parameter changes)")
+        oos_trades = run_backtest(ticker, args.oos_split, args.end,
+                                  args.min_conviction, args.portfolio)
+        oos_result = print_scorecard(oos_trades, ticker, args.oos_split, args.end,
+                                     args.min_conviction, args.portfolio, label="OUT-OF-SAMPLE")
+        if oos_result and args.dsr:
+            dsr = calc_dsr(oos_trades, n_trials=1)
+            oos_result["dsr"] = dsr
+
+        if is_result and oos_result:
+            print_oos_comparison(is_result, oos_result, ticker, args.oos_split)
+
+    else:
+        # ── Standard mode ──
+        trades = run_backtest(ticker, args.start, args.end,
+                              args.min_conviction, args.portfolio)
+        result = print_scorecard(trades, ticker, args.start, args.end,
+                                 args.min_conviction, args.portfolio)
+
+        if args.dsr and result:
+            try:
+                dsr = calc_dsr(trades, n_trials=9 if args.perturbation else 1)
+                print(f"\n  DSR: {dsr:.4f}  {'✅ ≥0.95' if dsr and dsr>=0.95 else '⚠️  <0.95'}" if dsr else "\n  DSR: insufficient data")
+            except ImportError:
+                print("\n  DSR: install scipy to enable (pip install scipy)")
+
+    if args.perturbation:
+        run_perturbation_test(ticker, args.start, args.end,
+                              args.min_conviction, args.portfolio)
 
 if __name__ == "__main__":
     main()

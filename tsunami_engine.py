@@ -20,6 +20,12 @@ try:
 except ImportError:
     HAS_PYWT = False
 
+try:
+    import ssqueezepy as ssq
+    HAS_SSQ = True
+except ImportError:
+    HAS_SSQ = False
+
 # -----------------------------------------------------------------------
 # Default watchlist
 # -----------------------------------------------------------------------
@@ -149,21 +155,40 @@ def init_db() -> None:
             cwt_cycle REAL, cwt_slope REAL, cwt_conc REAL, cwt_conc_3d REAL,
             exc_slope REAL, exc_reversal INTEGER,
             history_json TEXT, currency TEXT,
+            phase_velocity REAL, ridge_sharpness REAL, ridge_delta REAL,
+            compression_debt REAL, fisher_info REAL,
             PRIMARY KEY (ticker, scan_date)
         )
     """)
     con.commit()
+    # Migration — add new columns if upgrading from older DB
+    for col in [("phase_velocity","REAL"), ("ridge_sharpness","REAL"),
+                ("ridge_delta","REAL"), ("compression_debt","REAL"), ("fisher_info","REAL")]:
+        try:
+            cur.execute(f"ALTER TABLE scans ADD COLUMN {col[0]} {col[1]}")
+            con.commit()
+        except Exception:
+            pass  # column already exists
     con.close()
 
 def save_result(row: dict) -> None:
     con = sqlite3.connect(DB_PATH, timeout=30)
     cur = con.cursor()
     cur.execute("""
-        INSERT OR REPLACE INTO scans VALUES (
+        INSERT OR REPLACE INTO scans (
+            ticker, scan_date, as_of_date, price, pct_5d, pct_20d,
+            state, signal, stage, compression, energy, volume,
+            cwt_cycle, cwt_slope, cwt_conc, cwt_conc_3d,
+            exc_slope, exc_reversal, history_json, currency,
+            phase_velocity, ridge_sharpness, ridge_delta,
+            compression_debt, fisher_info
+        ) VALUES (
             :ticker,:scan_date,:as_of_date,:price,:pct_5d,:pct_20d,
             :state,:signal,:stage,:compression,:energy,:volume,
             :cwt_cycle,:cwt_slope,:cwt_conc,:cwt_conc_3d,
-            :exc_slope,:exc_reversal,:history_json,:currency
+            :exc_slope,:exc_reversal,:history_json,:currency,
+            :phase_velocity,:ridge_sharpness,:ridge_delta,
+            :compression_debt,:fisher_info
         )
     """, row)
     con.commit()
@@ -251,22 +276,89 @@ def _true_range(df):
     pc = df["close"].shift(1)
     return pd.concat([df["high"]-df["low"],(df["high"]-pc).abs(),(df["low"]-pc).abs()],axis=1).max(axis=1)
 
-def _cwt(x, min_c, max_c):
-    r = {"dominant_cycle": np.nan, "total_energy": np.nan, "energy_concentration": np.nan}
-    if not HAS_PYWT or len(x)<8 or not np.all(np.isfinite(x)): return r
+def _cwt_pywt(x, min_c, max_c):
+    """Original CWT using PyWavelets — with phase velocity via numpy."""
+    r = {"dominant_cycle": np.nan, "total_energy": np.nan, "energy_concentration": np.nan,
+         "phase_velocity": np.nan, "ridge_sharpness": np.nan}
+    if not HAS_PYWT or len(x) < 8 or not np.all(np.isfinite(x)): return r
     x = x - np.mean(x)
     if np.allclose(x, 0): return r
     cycles = np.arange(min_c, max_c+1, dtype=float)
     try:
-        coeffs,_ = pywt.cwt(x, cycles/1.03, CWT_WAVELET)
+        coeffs, _ = pywt.cwt(x, cycles/1.03, CWT_WAVELET)
     except: return r
-    power = np.abs(coeffs)**2; lp = power[:,-1]; total = float(np.sum(lp))
+    power = np.abs(coeffs)**2
+    lp = power[:, -1]
+    total = float(np.sum(lp))
     if total <= 0: return r
     mp = float(np.mean(lp))
-    r["dominant_cycle"] = float(cycles[np.argmax(lp)])
-    r["total_energy"]   = total
-    r["energy_concentration"] = lp[np.argmax(lp)]/mp if mp>0 else np.nan
+    peak_idx = int(np.argmax(lp))
+    r["dominant_cycle"]       = float(cycles[peak_idx])
+    r["total_energy"]         = total
+    r["energy_concentration"] = lp[peak_idx] / mp if mp > 0 else np.nan
+    r["ridge_sharpness"]      = r["energy_concentration"]
+
+    # ── Phase velocity via numpy phase derivative ──
+    # Rate of change of instantaneous frequency at the dominant cycle
+    # Low = steady organic cycle, High = external shock / false signal
+    try:
+        phase = np.angle(coeffs[peak_idx])  # phase of dominant scale over time
+        dphase = np.diff(phase)
+        # Unwrap jumps
+        dphase = np.where(dphase > np.pi,  dphase - 2*np.pi, dphase)
+        dphase = np.where(dphase < -np.pi, dphase + 2*np.pi, dphase)
+        inst_freq = np.abs(dphase) / (2 * np.pi)
+        # Phase velocity = std of instantaneous frequency over recent bars
+        # Low std = steady cycle, High std = erratic / noise
+        recent = inst_freq[-min(10, len(inst_freq)):]
+        if len(recent) > 2 and np.all(np.isfinite(recent)):
+            r["phase_velocity"] = float(np.std(recent))
+    except Exception:
+        pass
+
     return r
+
+
+def _cwt_sswt(x, min_c, max_c):
+    """
+    Synchrosqueezed Wavelet Transform — sharper frequency localisation.
+    Falls back to pywt if ssqueezepy call fails.
+    """
+    r = {"dominant_cycle": np.nan, "total_energy": np.nan, "energy_concentration": np.nan,
+         "phase_velocity": np.nan, "ridge_sharpness": np.nan}
+    if len(x) < 8 or not np.all(np.isfinite(x)): return r
+    x = x - np.mean(x)
+    if np.allclose(x, 0): return r
+    try:
+        Wx, scales, _ = ssq.cwt(x, wavelet="morlet", scales="log")
+        Tx, _, ssq_freqs, *_ = ssq.ssqueeze(Wx, scales, wavelet="morlet")
+        power = np.abs(Tx)**2
+        lp    = power[:, -1]
+        total = float(np.sum(lp))
+        if total <= 0: return _cwt_pywt(x, min_c, max_c)
+        n          = len(x)
+        cycle_bars = np.where(ssq_freqs > 0, n / (ssq_freqs * n), np.inf)
+        valid = (cycle_bars >= min_c) & (cycle_bars <= max_c)
+        if not np.any(valid): return _cwt_pywt(x, min_c, max_c)
+        lp_valid    = lp[valid]
+        cycles_valid= cycle_bars[valid]
+        dom_idx     = np.argmax(lp_valid)
+        mp          = float(np.mean(lp_valid))
+        ridge_sharp = float(lp_valid[dom_idx] / mp) if mp > 0 else np.nan
+        r["dominant_cycle"]       = float(cycles_valid[dom_idx])
+        r["total_energy"]         = total
+        r["energy_concentration"] = ridge_sharp
+        r["ridge_sharpness"]      = ridge_sharp
+        return r
+    except Exception:
+        return _cwt_pywt(x, min_c, max_c)
+
+
+def _cwt(x, min_c, max_c):
+    """Main CWT entry point. Uses SSWT if available, falls back to pywt."""
+    if HAS_SSQ:
+        return _cwt_sswt(x, min_c, max_c)
+    return _cwt_pywt(x, min_c, max_c)
 
 def _fft(x, min_c, max_c):
     if len(x)<8 or not np.all(np.isfinite(x)): return np.nan, np.nan
@@ -291,14 +383,69 @@ def run_pipeline(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     out["volume_ratio"]      = out["volume"]/out["vol_mean"]
     returns=out["log_return"].to_numpy()
     cycles=[np.nan]*len(out); energies=[np.nan]*len(out); concs=[np.nan]*len(out)
+    sharpness=[np.nan]*len(out); phase_vels=[np.nan]*len(out)
     for i in range(w,len(out)):
         seg=returns[i-w+1:i+1]
         if not np.all(np.isfinite(seg)): continue
-        if HAS_PYWT:
-            r=_cwt(seg,2,w); cycles[i]=r["dominant_cycle"]; energies[i]=r["total_energy"]; concs[i]=r["energy_concentration"]
+        if HAS_SSQ or HAS_PYWT:
+            r=_cwt(seg,2,w)
+            cycles[i]=r["dominant_cycle"]
+            energies[i]=r["total_energy"]
+            concs[i]=r["energy_concentration"]
+            sharpness[i]=r.get("ridge_sharpness", np.nan)
+            phase_vels[i]=r.get("phase_velocity", np.nan)
         else:
             dc,en=_fft(seg,2,w); cycles[i]=dc; energies[i]=en
-    out["cwt_dominant_cycle"]=cycles; out["spectral_energy"]=energies; out["cwt_energy_concentration"]=concs
+    out["cwt_dominant_cycle"]=cycles
+    out["spectral_energy"]=energies
+    out["cwt_energy_concentration"]=concs
+    out["ridge_sharpness"]=sharpness
+    out["phase_velocity"]=phase_vels
+    # ridge_delta — rate of change of ridge sharpness (3-bar slope)
+    out["ridge_delta"]=(out["ridge_sharpness"].rolling(3,min_periods=3)
+                        .apply(lambda x: np.polyfit(np.arange(len(x)),x,1)[0], raw=True))
+
+    # ── Compression Debt ──────────────────────────────────────────────
+    # Time-integral of compression: ∑(compression_ratio × days_compressed)
+    # Measures stored potential energy — how long and how tight the spring is wound
+    # Resets when compression_ratio >= 1.0 (compression released)
+    # Higher debt = more stored energy = larger expected breakout magnitude
+    comp = out["compression_ratio"].to_numpy()
+    debt = np.zeros(len(comp))
+    running = 0.0
+    for i in range(len(comp)):
+        if np.isfinite(comp[i]) and comp[i] < 1.0:
+            running += (1.0 - comp[i])  # debt accrues as gap below 1.0
+        else:
+            running = 0.0  # reset when compression released
+        debt[i] = running
+    out["compression_debt"] = debt
+
+    # ── Fisher Information ─────────────────────────────────────────────
+    # Measures information content of the CWT scalogram
+    # High FI = regime is about to shift (system becoming more ordered)
+    # Computed as FI = sum((dp/dt)^2 / p) where p is normalised power distribution
+    fi_vals = [np.nan] * len(out)
+    fi_window = 5  # bars to compute FI over
+    for i in range(w + fi_window, len(out)):
+        try:
+            seg = returns[i - w + 1:i + 1]
+            if not np.all(np.isfinite(seg)): continue
+            coeffs_fi, _ = pywt.cwt(seg, np.arange(2, w+1, dtype=float)/1.03, CWT_WAVELET)
+            power_fi = np.abs(coeffs_fi[:, -fi_window:]) ** 2
+            # Normalise to probability distribution per time step
+            col_sums = power_fi.sum(axis=0, keepdims=True)
+            col_sums = np.where(col_sums > 0, col_sums, 1)
+            p = power_fi / col_sums  # shape: (scales, fi_window)
+            # Fisher Information: FI = sum((dp)^2 / p) across scales
+            dp = np.diff(p, axis=1)  # (scales, fi_window-1)
+            p_mid = p[:, :-1]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                fi_terms = np.where(p_mid > 1e-10, dp**2 / p_mid, 0)
+            fi_vals[i] = float(np.sum(fi_terms))
+        except Exception:
+            pass
+    out["fisher_info"] = fi_vals
     out["energy_mean"]=out["spectral_energy"].rolling(w,min_periods=w).mean()
     out["energy_ratio"]=np.where(out["energy_mean"]>0,out["spectral_energy"]/out["energy_mean"],np.nan)
     out["cwt_cycle_slope"]=(out["cwt_dominant_cycle"].rolling(CWT_SLOPE_BACK,min_periods=CWT_SLOPE_BACK)
@@ -390,7 +537,9 @@ def run_scan(tickers=None):
                            "stage":0,"compression":None,"energy":None,"volume":None,
                            "cwt_cycle":None,"cwt_slope":None,"cwt_conc":None,"cwt_conc_3d":None,
                            "exc_slope":None,"exc_reversal":0,"history_json":"[]",
-                           "currency":info.get("currency","USD")}
+                           "currency":info.get("currency","USD"),
+                           "phase_velocity":None,"ridge_sharpness":None,"ridge_delta":None,
+                           "compression_debt":None,"fisher_info":None}
                     save_result(row)
                     results.append(row)
                     print(f"CA$1 = US${price:.4f}")
@@ -423,26 +572,31 @@ def run_scan(tickers=None):
         state  = str(row["market_state"])
         stage  = STATE_STAGE.get(state, 0)
         result = {
-            "ticker":       ticker,
-            "scan_date":    today,
-            "as_of_date":   pd.to_datetime(row["date"]).strftime("%Y-%m-%d"),
-            "price":        fv(row["close"]),
-            "pct_5d":       round(pct_5d,2)  if pct_5d  is not None else None,
-            "pct_20d":      round(pct_20d,2) if pct_20d is not None else None,
-            "state":        state,
-            "signal":       str(row["signal"]),
-            "stage":        stage,
-            "compression":  fv(row["compression_ratio"]),
-            "energy":       fv(row["energy_ratio"]),
-            "volume":       fv(row["volume_ratio"]),
-            "cwt_cycle":    fv(row["cwt_dominant_cycle"]),
-            "cwt_slope":    fv(row["cwt_cycle_slope"]),
-            "cwt_conc":     fv(row["cwt_energy_concentration"]),
-            "cwt_conc_3d":  fv(row["cwt_conc_min_3"]),
-            "exc_slope":    fv(row["excursion_slope"]),
-            "exc_reversal": int(bool(row["excursion_reversal"])),
-            "history_json": history_json,
-            "currency":     info.get("currency","USD"),
+            "ticker":         ticker,
+            "scan_date":      today,
+            "as_of_date":     pd.to_datetime(row["date"]).strftime("%Y-%m-%d"),
+            "price":          fv(row["close"]),
+            "pct_5d":         round(pct_5d,2)  if pct_5d  is not None else None,
+            "pct_20d":        round(pct_20d,2) if pct_20d is not None else None,
+            "state":          state,
+            "signal":          str(row["signal"]),
+            "stage":           stage,
+            "compression":     fv(row["compression_ratio"]),
+            "energy":          fv(row["energy_ratio"]),
+            "volume":          fv(row["volume_ratio"]),
+            "cwt_cycle":       fv(row["cwt_dominant_cycle"]),
+            "cwt_slope":       fv(row["cwt_cycle_slope"]),
+            "cwt_conc":        fv(row["cwt_energy_concentration"]),
+            "cwt_conc_3d":     fv(row["cwt_conc_min_3"]),
+            "exc_slope":       fv(row["excursion_slope"]),
+            "exc_reversal":    int(bool(row["excursion_reversal"])),
+            "history_json":    history_json,
+            "currency":        info.get("currency","USD"),
+            "phase_velocity":   fv(row.get("phase_velocity", np.nan)),
+            "ridge_sharpness":  fv(row.get("ridge_sharpness", np.nan)),
+            "ridge_delta":      fv(row.get("ridge_delta", np.nan)),
+            "compression_debt": fv(row.get("compression_debt", np.nan)),
+            "fisher_info":      fv(row.get("fisher_info", np.nan)),
         }
 
         save_result(result)

@@ -21,22 +21,69 @@ from tsunami_universe import (
 from tsunami_trades import (init_trades_tables, get_portfolio_value, set_portfolio_value,
     add_custom_ticker, load_custom_tickers, get_entry_signals, check_exit_signals,
     load_open_trades, load_closed_trades, log_trade, trade_summary,
-    get_cadusd_rate, currency_symbol, is_cad, MIN_CONVICTION, MIN_STAGE)
+    get_cadusd_rate, currency_symbol, is_cad, MIN_CONVICTION, MIN_STAGE,
+    open_paper_trade, close_paper_trade, load_open_paper_trades,
+    load_closed_paper_trades, paper_trade_scorecard, get_atr, position_size,
+    ATR_MULT, DEFAULT_PORT)
 
 BG_DEEP="#080b12";BG_CARD="#0f1420";BG_PANEL="#141927";BORDER="#1e2740"
 TEXT_PRI="#e8eaf6";TEXT_SEC="#7986cb";TEXT_DIM="#424870";ACCENT="#5c6bc0"
 
 STATE_COLOR={"compressed":"#37474f","coiling":"#f57c00","excursion_reversal":"#66bb6a",
     "sustained_focus":"#ab47bc","early_watch":"#26c6da","pre_breakout":"#ec407a",
-    "expanding":"#ff7043","breakout_state":"#ef5350","neutral":"#455a64","insufficient_data":"#263238"}
-STATE_EMOJI={"compressed":"😴","coiling":"🌀","excursion_reversal":"🔄","sustained_focus":"🔭",
-    "early_watch":"👁","pre_breakout":"⚡","expanding":"💥","breakout_state":"🚀","neutral":"😐","insufficient_data":"⏳"}
-STATE_BUCKET={"breakout_state":"🚀 READY","expanding":"🚀 READY","pre_breakout":"⚡ BUILDING",
-    "early_watch":"⚡ BUILDING","sustained_focus":"🔭 BUILDING","excursion_reversal":"🔄 EARLY WARNING",
-    "coiling":"👀 WATCH","compressed":"👀 WATCH","neutral":"😐 QUIET","insufficient_data":"😐 QUIET"}
-BUCKET_ORDER=["🚀 READY","⚡ BUILDING","🔭 BUILDING","🔄 EARLY WARNING","👀 WATCH","😐 QUIET"]
-BUCKET_COLOR={"🚀 READY":"#ef5350","⚡ BUILDING":"#ec407a","🔭 BUILDING":"#ab47bc",
-    "🔄 EARLY WARNING":"#66bb6a","👀 WATCH":"#f57c00","😐 QUIET":"#455a64"}
+    "expanding":"#ef5350","breakout_state":"#ef5350","neutral":"#455a64","insufficient_data":"#263238"}
+STATE_EMOJI={"compressed":"😴","coiling":"🌀","excursion_reversal":"⚡","sustained_focus":"🔭",
+    "early_watch":"👁","pre_breakout":"🎯","expanding":"🚀","breakout_state":"🚀","neutral":"😐","insufficient_data":"⏳"}
+
+# Human-readable state labels — no internal jargon
+STATE_LABEL={
+    "compressed":         "Quiet",
+    "coiling":            "Winding Up",
+    "excursion_reversal": "Early Signal",
+    "sustained_focus":    "Building",
+    "early_watch":        "Worth Watching",
+    "pre_breakout":       "Setup Loading",
+    "expanding":          "Breaking Out",
+    "breakout_state":     "Breaking Out",
+    "neutral":            "Nothing Yet",
+    "insufficient_data":  "Not Enough Data",
+}
+
+def plain_english(r: dict) -> str:
+    """One plain-English sentence describing what this asset is doing right now."""
+    state  = r.get("state","neutral")
+    ticker = r.get("ticker","")
+    signal = r.get("signal","")
+    energy = r.get("energy")
+    days   = ""
+
+    if state == "compressed":
+        return f"{ticker} is quiet. Volatility is low and cycles are tightening. Nothing to act on yet — just keep watching."
+    if state == "coiling":
+        return f"{ticker} is winding up. Pressure is building under the surface. Not ready yet, but worth keeping on your radar."
+    if state == "excursion_reversal":
+        return f"{ticker} just showed an early signal — energy peaked and reversed. This is a warning shot. Something may be shifting."
+    if state == "sustained_focus":
+        return f"{ticker} has been holding its compression for an extended period. The setup is maturing. Patience — this one is building toward something."
+    if state == "early_watch":
+        return f"{ticker} is starting to show the right conditions. Energy is rising and cycles are shortening. Worth watching closely now."
+    if state == "pre_breakout":
+        return f"{ticker} looks loaded. All the conditions are aligning — tight cycles, rising energy, increasing concentration. A move could be imminent."
+    if state in ("expanding","breakout_state"):
+        if "bullish" in signal:
+            return f"{ticker} is breaking out to the upside. Energy has released and momentum is pointing higher. The move is underway."
+        elif "bearish" in signal:
+            return f"{ticker} is breaking out to the downside. Energy has released with bearish bias. The move is underway."
+        return f"{ticker} is in breakout mode. Energy has released strongly. Watch for follow-through."
+    return f"{ticker} is in a neutral state. No clear regime signal right now."
+
+STATE_BUCKET={"breakout_state":"🚀 Breaking Out","expanding":"🚀 Breaking Out","pre_breakout":"🎯 Setup Loading",
+    "early_watch":"👁 Worth Watching","sustained_focus":"🔭 Building","excursion_reversal":"⚡ Early Signal",
+    "coiling":"🌀 Winding Up","compressed":"😴 Quiet","neutral":"😐 Nothing Yet","insufficient_data":"😐 Nothing Yet"}
+BUCKET_ORDER=["🚀 Breaking Out","🎯 Setup Loading","🔭 Building","⚡ Early Signal","👁 Worth Watching","🌀 Winding Up","😴 Quiet","😐 Nothing Yet"]
+BUCKET_COLOR={"🚀 Breaking Out":"#ef5350","🎯 Setup Loading":"#ec407a","🔭 Building":"#ab47bc",
+    "⚡ Early Signal":"#66bb6a","👁 Worth Watching":"#26c6da","🌀 Winding Up":"#f57c00",
+    "😴 Quiet":"#455a64","😐 Nothing Yet":"#455a64"}
 
 def conviction_score(r):
     s = 0
@@ -132,27 +179,74 @@ def stage_bar(stage):
 def make_phase_chart(ticker,history_json,height=380,show_title=True):
     try:hist=pd.DataFrame(json.loads(history_json))
     except:return go.Figure()
-    hist=hist.dropna(subset=["compression_ratio","cwt_cycle_slope","energy_ratio"])
-    if len(hist)<5:return go.Figure()
+    # Try full dropna first, fall back to partial if needed
+    hist_full=hist.dropna(subset=["compression_ratio","cwt_cycle_slope","energy_ratio"])
+    if len(hist_full)>=3:
+        hist=hist_full
+    else:
+        # Fall back — fill missing slope with 0
+        hist=hist.copy()
+        hist["cwt_cycle_slope"]=hist["cwt_cycle_slope"].fillna(0)
+        hist["energy_ratio"]=hist["energy_ratio"].fillna(1)
+        hist=hist.dropna(subset=["compression_ratio"])
+    if len(hist)<3:return go.Figure()
     n=len(hist);fig=go.Figure()
+
+    # ── Coloured regime zones ──
+    # Breakout zone — high energy, any compression, any slope
+    fig.add_trace(go.Scatter3d(
+        x=[0.8,2.0,2.0,0.8,0.8], y=[-15,-15,15,15,-15],
+        z=[1.55,1.55,1.55,1.55,1.55],
+        mode="lines", line=dict(color="rgba(239,83,80,0.6)",width=3),
+        name="🚀 Breaking Out", showlegend=True, hoverinfo="skip"))
+    # Pre-breakout zone
+    fig.add_trace(go.Scatter3d(
+        x=[0.7,1.1,1.1,0.7,0.7], y=[-15,-15,0,0,-15],
+        z=[1.15,1.15,1.15,1.15,1.15],
+        mode="lines", line=dict(color="rgba(236,64,122,0.5)",width=2),
+        name="🎯 Setup Loading", showlegend=True, hoverinfo="skip"))
+    # Compressed zone
+    fig.add_trace(go.Scatter3d(
+        x=[0.5,0.85,0.85,0.5,0.5], y=[-5,-5,5,5,-5],
+        z=[0.6,0.6,0.6,0.6,0.6],
+        mode="lines", line=dict(color="rgba(55,71,79,0.5)",width=2),
+        name="😴 Quiet/Compressed", showlegend=True, hoverinfo="skip"))
+
+    # Trail coloured by stage
+    stage_colors = {0:"#455a64",1:"#f57c00",2:"#66bb6a",3:"#ab47bc",4:"#ec407a",5:"#ef5350"}
+    if "market_state" in hist.columns:
+        from tsunami_engine import STATE_STAGE
+        trail_colors = [stage_colors.get(STATE_STAGE.get(str(s),0),"#5c6bc0")
+                       for s in hist["market_state"]]
+    else:
+        trail_colors = [f"rgba(92,107,192,{0.3+0.7*i/n})" for i in range(n)]
+
     fig.add_trace(go.Scatter3d(x=hist["compression_ratio"],y=hist["cwt_cycle_slope"],z=hist["energy_ratio"],
-        mode="lines",line=dict(color="rgba(92,107,192,0.3)",width=2),hoverinfo="skip",name="path",showlegend=True))
-    fig.add_trace(go.Scatter3d(x=hist["compression_ratio"],y=hist["cwt_cycle_slope"],z=hist["energy_ratio"],
-        mode="markers",marker=dict(size=3,color=list(range(n)),colorscale=[[0,"#1a237e"],[0.5,"#5c6bc0"],[1,"#e8eaf6"]],opacity=0.8),
-        text=hist.get("date",pd.Series([""]*n)),hovertemplate="%{text}<extra></extra>",name="days",showlegend=True))
-    last=hist.iloc[-1];last_color=STATE_COLOR.get(str(last.get("market_state","neutral")),"#ef5350")
+        mode="lines+markers",
+        line=dict(color=list(range(n)),colorscale=[[0,"#1a237e"],[0.5,"#5c6bc0"],[1,"#e8eaf6"]],width=3),
+        marker=dict(size=2,color=trail_colors),
+        text=hist.get("date",pd.Series([""]*n)),
+        hovertemplate="%{text}<extra></extra>",name="Path",showlegend=True))
+
+    last=hist.iloc[-1]
+    state_str=str(last.get("market_state","neutral"))
+    last_color=STATE_COLOR.get(state_str,"#ef5350")
+    last_label=STATE_LABEL.get(state_str,"Now")
     z_off=float(last["energy_ratio"])+0.3
     fig.add_trace(go.Scatter3d(x=[last["compression_ratio"]],y=[last["cwt_cycle_slope"]],z=[z_off],
         mode="markers+text",marker=dict(size=12,color=last_color,symbol="diamond",line=dict(color="white",width=2)),
-        text=[f"NOW\n{ticker}"],textfont=dict(color="white",size=11,family="monospace"),
-        textposition="top center",name="today",showlegend=True,hovertemplate=f"<b>TODAY — {ticker}</b><extra></extra>"))
+        text=[f"{ticker}\n{last_label}"],textfont=dict(color="white",size=11,family="monospace"),
+        textposition="top center",name="Now",showlegend=True,
+        hovertemplate=f"<b>NOW — {ticker} — {last_label}</b><extra></extra>"))
+
     fig.update_layout(height=height,margin=dict(l=0,r=0,t=30 if show_title else 10,b=0),paper_bgcolor=BG_DEEP,
         scene=dict(bgcolor=BG_PANEL,
             xaxis=dict(title="Compression",color=TEXT_SEC,backgroundcolor=BG_PANEL,gridcolor=BORDER),
             yaxis=dict(title="CWT Slope",color=TEXT_SEC,backgroundcolor=BG_PANEL,gridcolor=BORDER),
             zaxis=dict(title="Energy",color=TEXT_SEC,backgroundcolor=BG_PANEL,gridcolor=BORDER)),
-        title=dict(text=f"{ticker} — Phase Space" if show_title else "",font=dict(color=TEXT_SEC,size=12)),
-        legend=dict(bgcolor=BG_PANEL,font=dict(color=TEXT_SEC),itemsizing="constant"))
+        title=dict(text=f"{ticker} — Phase Space (coloured by regime)" if show_title else "",
+            font=dict(color=TEXT_SEC,size=12)),
+        legend=dict(bgcolor=BG_PANEL,font=dict(color=TEXT_SEC,size=10),itemsizing="constant"))
     return fig
 
 def get_ai_commentary(r):
@@ -164,7 +258,7 @@ def get_ai_commentary(r):
         key=cfg.get("anthropic_api_key","")
         resp=requests.post("https://api.anthropic.com/v1/messages",
             headers={"Content-Type":"application/json","x-api-key":key,"anthropic-version":"2023-06-01"},
-            json={"model":"claude-sonnet-4-20250514","max_tokens":300,"messages":[{"role":"user","content":prompt}]},timeout=30)
+            json={"model":"claude-haiku-4-5-20251001","max_tokens":300,"messages":[{"role":"user","content":prompt}]},timeout=30)
         data=resp.json()
         if "content" in data and data["content"]:return data["content"][0].get("text","").strip()
         return "Analysis unavailable."
@@ -192,24 +286,24 @@ def get_or_generate(r):
 
 # Tsunami Compatibility Ratings — derived from backtest results
 TSUNAMI_RATINGS = {
-    "TSLA":    ("🌊🌊🌊", "ELITE",        "#ef5350"),
-    "NVDA":    ("🌊🌊🌊", "ELITE",        "#ef5350"),
-    "XRP-USD": ("🌊🌊",   "COMPATIBLE",   "#66bb6a"),
-    "BNB-USD": ("🌊🌊",   "COMPATIBLE",   "#66bb6a"),
-    "BTC-USD": ("🌊🌊",   "COMPATIBLE",   "#66bb6a"),
-    "SOL-USD": ("🌊🌊",   "COMPATIBLE",   "#66bb6a"),
-    "AAPL":    ("🌊🌊",   "COMPATIBLE",   "#66bb6a"),
-    "XOM":     ("🌊🌊",   "COMPATIBLE",   "#66bb6a"),
-    "ETH-USD": ("⚠️",     "INCOMPATIBLE", "#f57c00"),
-    "META":    ("⚠️",     "INCOMPATIBLE", "#f57c00"),
-    "MSFT":    ("⚠️",     "INCOMPATIBLE", "#f57c00"),
+    "TSLA":    ("🌊🌊🌊", "Best Fit",   "#ef5350"),
+    "NVDA":    ("🌊🌊🌊", "Best Fit",   "#ef5350"),
+    "XRP-USD": ("🌊🌊",   "Works Well", "#66bb6a"),
+    "BNB-USD": ("🌊🌊",   "Works Well", "#66bb6a"),
+    "BTC-USD": ("🌊🌊",   "Works Well", "#66bb6a"),
+    "SOL-USD": ("🌊🌊",   "Works Well", "#66bb6a"),
+    "AAPL":    ("🌊🌊",   "Works Well", "#66bb6a"),
+    "XOM":     ("🌊🌊",   "Works Well", "#66bb6a"),
+    "ETH-USD": ("⚠️",     "Poor Fit",   "#f57c00"),
+    "META":    ("⚠️",     "Poor Fit",   "#f57c00"),
+    "MSFT":    ("⚠️",     "Poor Fit",   "#f57c00"),
 }
 
 def compatibility_badge(ticker):
     if ticker not in TSUNAMI_RATINGS: return html.Span()
     icon, label, color = TSUNAMI_RATINGS[ticker]
     return html.Span(f"{icon}",
-        title=f"Tsunami {label}",
+        title=f"Tsunami {label} — based on backtest results",
         style={"fontSize":"11px","marginLeft":"5px","cursor":"help"})
 
 def asset_card(r,idx):
@@ -223,13 +317,15 @@ def asset_card(r,idx):
     exc_badge=html.Span("🔄",style={"marginLeft":"4px","fontSize":"12px"}) if r.get("exc_reversal") else html.Span()
     cad_badge=html.Span("🍁",style={"marginLeft":"4px","fontSize":"10px"}) if is_cad(ticker) else html.Span()
     compat_badge=compatibility_badge(ticker)
-    return html.Div(id={"type":"card","index":idx},children=[
+    ticker=r["ticker"]
+    safe_ticker = ticker.replace(".","__").replace("^","__").replace("=","__")
+    return html.Div(id={"type":"card","index":safe_ticker},children=[
         html.Div([
             html.Div([html.Span(f"{emoji} ",style={"fontSize":"15px"}),
                 html.Span(info["label"],style={"fontWeight":"700","color":TEXT_PRI,"fontSize":"13px"}),
                 html.Span(f" {ticker}",style={"color":TEXT_DIM,"fontSize":"10px","marginLeft":"3px"}),exc_badge,cad_badge,compat_badge]),
             html.Div([html.Span(str(score),style={"fontSize":"22px","fontWeight":"900","color":sc,"marginRight":"10px"}),
-                html.Span(state.replace("_"," ").upper(),style={"background":color,"color":"white","fontSize":"9px","padding":"3px 8px","borderRadius":"8px","fontWeight":"700"})],
+                html.Span(STATE_LABEL.get(state, state.replace('_',' ').title()),style={"background":color,"color":"white","fontSize":"9px","padding":"3px 8px","borderRadius":"8px","fontWeight":"700"})],
                 style={"display":"flex","alignItems":"center"}),
         ],style={"display":"flex","justifyContent":"space-between","alignItems":"center","marginBottom":"8px"}),
         html.Div([html.Span(price_str,style={"fontSize":"20px","fontWeight":"700","color":"white"}),
@@ -241,13 +337,30 @@ def asset_card(r,idx):
         stage_bar(stage),
         html.Div([*[html.Div([
             html.Div(label,style={"fontSize":"9px","color":TEXT_DIM,"textTransform":"uppercase","marginBottom":"2px"}),
-            html.Div(val,style={"fontSize":"12px","fontWeight":"600","color":TEXT_PRI}),
+            html.Div(val,style={"fontSize":"12px","fontWeight":"600","color":vc}),
         ],style={"background":BG_DEEP,"borderRadius":"6px","padding":"5px 7px","textAlign":"center"})
-          for label,val in [("Compress",fmt_val(r.get("compression"))),("Energy",fmt_val(r.get("energy"))),
-            ("Volume",fmt_val(r.get("volume"))),("Slope",fmt_val(r.get("cwt_slope"),2)),
-            ("Conc",fmt_val(r.get("cwt_conc"),2)),("Exc Sl",fmt_val(r.get("exc_slope"),3))]]],
-        style={"display":"grid","gridTemplateColumns":"repeat(3,1fr)","gap":"5px","marginTop":"10px"}),
+          for label,val,vc in [
+            ("Compress",fmt_val(r.get("compression")),TEXT_PRI),
+            ("Energy",fmt_val(r.get("energy")),TEXT_PRI),
+            ("Volume",fmt_val(r.get("volume")),TEXT_PRI),
+            ("Slope",fmt_val(r.get("cwt_slope"),2),TEXT_PRI),
+            ("Conc",fmt_val(r.get("cwt_conc"),2),TEXT_PRI),
+            ("Exc Sl",fmt_val(r.get("exc_slope"),3),TEXT_PRI),
+            ("Ridge",fmt_val(r.get("ridge_sharpness"),1),
+             "#66bb6a" if (r.get("ridge_sharpness") or 0)>8 else "#f57c00" if (r.get("ridge_sharpness") or 0)>5 else TEXT_DIM),
+            ("Phase Vel",fmt_val(r.get("phase_velocity"),4),
+             "#66bb6a" if (r.get("phase_velocity") or 1)<0.01 else "#f57c00" if (r.get("phase_velocity") or 1)<0.03 else "#ef5350"),
+            ("Rdg Δ",fmt_val(r.get("ridge_delta"),2),
+             "#66bb6a" if (r.get("ridge_delta") or 0)>0 else "#ef5350"),
+            ("C.Debt",fmt_val(r.get("compression_debt"),1),
+             "#ef5350" if (r.get("compression_debt") or 0)>10 else "#f57c00" if (r.get("compression_debt") or 0)>5 else TEXT_DIM),
+            ("Fisher",fmt_val(r.get("fisher_info"),3),
+             "#66bb6a" if (r.get("fisher_info") or 0)>0.5 else TEXT_DIM),
+          ]]],
+        style={"display":"grid","gridTemplateColumns":"repeat(4,1fr)","gap":"5px","marginTop":"10px"}),
         html.Div("Click to expand →",style={"textAlign":"right","fontSize":"9px","color":TEXT_DIM,"marginTop":"8px"}),
+        html.Div(plain_english(r),style={"fontSize":"11px","color":TEXT_DIM,"marginTop":"6px",
+            "fontStyle":"italic","borderTop":f"1px solid {BORDER}","paddingTop":"6px","lineHeight":"1.5"}),
     ],n_clicks=0,style={"background":BG_CARD,"border":f"1px solid {color}40","borderLeft":f"4px solid {color}",
                          "borderRadius":"10px","padding":"14px","cursor":"pointer","userSelect":"none"})
 
@@ -274,25 +387,60 @@ def detail_panel(r):
     return html.Div([
         html.Div([
             html.Div([html.H2(f"{STATE_EMOJI.get(state,'')} {info['label']}",style={"margin":"0","color":TEXT_PRI,"fontSize":"20px"}),
-                html.Div(f"Stage {stage} · {state.replace('_',' ').upper()}",style={"color":color,"fontSize":"13px","fontWeight":"600","marginTop":"4px"})]),
+                html.Div(f"Stage {stage} · {STATE_LABEL.get(state, state.replace('_',' ').title())}",style={"color":color,"fontSize":"13px","fontWeight":"600","marginTop":"4px"})]),
             html.Div([conviction_widget(score,"large"),
                 html.Button("✕",id="close-btn",n_clicks=0,style={"background":"none","border":f"1px solid {BORDER}",
                     "color":TEXT_SEC,"borderRadius":"6px","padding":"8px 14px","cursor":"pointer","fontSize":"13px","marginLeft":"12px"})],
                 style={"display":"flex","alignItems":"center"}),
         ],style={"display":"flex","justifyContent":"space-between","alignItems":"flex-start","marginBottom":"20px"}),
-        html.Div([*[html.Div([
-            html.Div(label,style={"fontSize":"10px","color":TEXT_DIM,"textTransform":"uppercase","marginBottom":"3px"}),
-            html.Div(val,style={"fontSize":"15px","fontWeight":"700","color":vc}),
-        ],style={"background":BG_DEEP,"borderRadius":"8px","padding":"10px 12px","textAlign":"center"})
-          for label,val,vc in [
-            ("Price",fmt_price(r.get("price"),ticker),TEXT_PRI),("5d Return",pct5_str,pct5c),("20d Return",pct20_str,pct20c),
-            ("Compression",fmt_val(r.get("compression")),TEXT_PRI),("Energy",fmt_val(r.get("energy")),TEXT_PRI),
-            ("Volume",fmt_val(r.get("volume")),TEXT_PRI),("CWT Cycle",fmt_val(r.get("cwt_cycle"),0)+" bars",TEXT_PRI),
-            ("CWT Slope",fmt_val(r.get("cwt_slope"),2),TEXT_PRI),("Conc",fmt_val(r.get("cwt_conc"),2),TEXT_PRI),
-            ("Conc 3d",fmt_val(r.get("cwt_conc_3d"),2),TEXT_PRI),("Exc Slope",fmt_val(r.get("exc_slope"),4),TEXT_PRI),
-            ("Exc Reversal","✅ YES" if r.get("exc_reversal") else "—",TEXT_PRI)]],
+        html.Div([
+            html.Div([
+                html.Div(label,style={"fontSize":"10px","color":TEXT_DIM,"textTransform":"uppercase","marginBottom":"3px"}),
+                html.Div(val,style={"fontSize":"15px","fontWeight":"700","color":vc}),
+            ],style={"background":BG_DEEP,"borderRadius":"8px","padding":"10px 12px","textAlign":"center"})
+            for label,val,vc in [
+                ("Price",fmt_price(r.get("price"),ticker),TEXT_PRI),
+                ("5d Return",pct5_str,pct5c),
+                ("20d Return",pct20_str,pct20c),
+                ("Compression",fmt_val(r.get("compression")),TEXT_PRI),
+                ("Energy",fmt_val(r.get("energy")),TEXT_PRI),
+                ("Volume",fmt_val(r.get("volume")),TEXT_PRI),
+                ("CWT Cycle",fmt_val(r.get("cwt_cycle"),0)+" bars",TEXT_PRI),
+                ("CWT Slope",fmt_val(r.get("cwt_slope"),2),TEXT_PRI),
+                ("Conc",fmt_val(r.get("cwt_conc"),2),TEXT_PRI),
+                ("Conc 3d",fmt_val(r.get("cwt_conc_3d"),2),TEXT_PRI),
+                ("Exc Slope",fmt_val(r.get("exc_slope"),4),TEXT_PRI),
+                ("Exc Reversal","✅ YES" if r.get("exc_reversal") else "—",TEXT_PRI),
+                ("Ridge Sharp",fmt_val(r.get("ridge_sharpness"),2),
+                 "#66bb6a" if (r.get("ridge_sharpness") or 0)>8 else "#f57c00" if (r.get("ridge_sharpness") or 0)>5 else TEXT_DIM),
+                ("Phase Vel",fmt_val(r.get("phase_velocity"),5),
+                 "#66bb6a" if (r.get("phase_velocity") or 1)<0.01 else "#f57c00" if (r.get("phase_velocity") or 1)<0.03 else "#ef5350"),
+                ("Ridge Δ",fmt_val(r.get("ridge_delta"),3),
+                 "#66bb6a" if (r.get("ridge_delta") or 0)>0 else "#ef5350"),
+                ("Compress Debt",fmt_val(r.get("compression_debt"),1),
+                 "#ef5350" if (r.get("compression_debt") or 0)>10 else "#f57c00" if (r.get("compression_debt") or 0)>5 else TEXT_DIM),
+                ("Fisher Info",fmt_val(r.get("fisher_info"),4),
+                 "#66bb6a" if (r.get("fisher_info") or 0)>0.5 else TEXT_DIM),
+            ]
         ],style={"display":"grid","gridTemplateColumns":"repeat(auto-fill,minmax(110px,1fr))","gap":"8px","marginBottom":"20px"}),
         dcc.Graph(figure=phase_fig,config={"displayModeBar":True}),
+        # Plain English summary
+        html.Div([
+            html.Div("📖 What's happening",style={"fontSize":"10px","color":TEXT_DIM,
+                "textTransform":"uppercase","letterSpacing":"1px","marginBottom":"8px"}),
+            html.P(plain_english(r),style={"color":TEXT_PRI,"fontSize":"14px",
+                "lineHeight":"1.75","margin":"0","fontStyle":"italic"}),
+        ],style={"background":BG_DEEP,"borderRadius":"8px","padding":"16px","marginTop":"16px"}),
+        html.Div([
+            html.Button("📝 Paper Trade This — Review & Confirm",
+                id={"type":"paper-from-detail","ticker":ticker},
+                n_clicks=0,
+                style={"background":"#1a3a2a","color":"#00e676","border":"1px solid #00e67640",
+                    "borderRadius":"8px","padding":"10px 20px","cursor":"pointer","fontWeight":"700",
+                    "fontSize":"13px","marginTop":"16px","width":"100%"}),
+            html.Div(id={"type":"paper-detail-status","ticker":ticker},
+                style={"color":TEXT_DIM,"fontSize":"11px","marginTop":"6px","textAlign":"center"}),
+        ]),
     ],style={"background":BG_CARD,"border":f"2px solid {color}","borderRadius":"12px","padding":"24px","marginBottom":"20px"})
 
 def intelligence_card(r,commentary):
@@ -306,7 +454,7 @@ def intelligence_card(r,commentary):
                 html.Span(info["label"],style={"fontWeight":"700","color":TEXT_PRI,"fontSize":"17px"}),
                 html.Span(f" {ticker}",style={"color":TEXT_DIM,"fontSize":"12px","marginLeft":"4px"})]),
             html.Div([html.Span(f"Stage {stage}",style={"color":color,"fontWeight":"700","fontSize":"13px","marginRight":"10px"}),
-                html.Span(state.replace("_"," ").upper(),style={"background":color,"color":"white","fontSize":"9px","padding":"3px 8px","borderRadius":"8px","fontWeight":"700"}),
+                html.Span(STATE_LABEL.get(state, state.replace('_',' ').title()),style={"background":color,"color":"white","fontSize":"9px","padding":"3px 8px","borderRadius":"8px","fontWeight":"700"}),
                 html.Span(f"  {pct5_str}",style={"color":pct5c,"fontSize":"13px","fontWeight":"600","marginLeft":"10px"})]),
         ],style={"display":"flex","justifyContent":"space-between","alignItems":"center","marginBottom":"16px"}),
         html.Div([
@@ -416,31 +564,34 @@ def build_trades_tab(rows):
     cadusd = get_cadusd_rate()
     custom = load_custom_tickers()
 
-    # Custom ticker rows with remove button
+    # Custom ticker rows with prominent remove button
     custom_rows = []
     for c in custom:
         flag = "🍁" if c["ticker"].endswith(".TO") else "🇺🇸"
         safe_id = c["ticker"].replace(".", "_").replace("^", "_").replace("=", "_")
         custom_rows.append(html.Div([
             html.Div([
-                html.Span(flag, style={"marginRight":"8px","fontSize":"14px"}),
-                html.Span(c["ticker"], style={"fontWeight":"700","color":TEXT_PRI,"fontSize":"13px","marginRight":"6px"}),
-                html.Span(f"— {c['label']}", style={"color":TEXT_DIM,"fontSize":"12px"}),
+                html.Span(flag, style={"marginRight":"8px","fontSize":"16px"}),
+                html.Div([
+                    html.Span(c["ticker"], style={"fontWeight":"700","color":TEXT_PRI,"fontSize":"14px","marginRight":"6px"}),
+                    html.Span(c["label"], style={"color":TEXT_DIM,"fontSize":"12px"}),
+                ]),
             ], style={"display":"flex","alignItems":"center"}),
             html.Button("✕ Remove",
-                id={"type":"remove-ticker","index":safe_id,"ticker":c["ticker"]},
+                id={"type":"remove-ticker","index":safe_id},
                 n_clicks=0,
-                style={"background":"none","border":f"1px solid #ef535040","color":"#ef5350",
-                       "borderRadius":"6px","padding":"4px 10px","cursor":"pointer",
-                       "fontSize":"11px","fontWeight":"600"}),
+                style={"background":"#3a1a1a","border":"1px solid #ef535080","color":"#ef5350",
+                       "borderRadius":"8px","padding":"8px 16px","cursor":"pointer",
+                       "fontSize":"12px","fontWeight":"700"}),
         ], style={"display":"flex","justifyContent":"space-between","alignItems":"center",
-                  "padding":"10px 0","borderBottom":f"1px solid {BORDER}"}))
+                  "padding":"14px 16px","borderRadius":"8px","marginBottom":"8px",
+                  "background":BG_DEEP,"border":f"1px solid {BORDER}"}))
 
     return html.Div([
         # Header
         html.Div([
-            html.Div("⚡ Watchlist", style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI}),
-            html.Div(f"CA$1 = US${cadusd:.4f}  ·  {len(custom)} custom tickers",
+            html.Div("➕ Add Assets", style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI}),
+            html.Div(f"Custom assets always appear on the grid  ·  CA$1 = US${cadusd:.4f}",
                 style={"color":TEXT_DIM,"fontSize":"12px","marginTop":"3px"}),
         ], style={"marginBottom":"24px","paddingBottom":"16px","borderBottom":f"1px solid {BORDER}"}),
 
@@ -471,9 +622,9 @@ def build_trades_tab(rows):
 
         # Custom ticker list
         html.Div([
-            html.Div(f"Custom Tickers ({len(custom)})",
+            html.Div(f"Your Assets ({len(custom)})",
                 style={"fontSize":"13px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"4px"}),
-            html.Div("These are scanned daily alongside the default watchlist",
+            html.Div("These always appear on the grid regardless of their current stage",
                 style={"fontSize":"11px","color":TEXT_DIM,"marginBottom":"16px"}),
             *(custom_rows if custom_rows else [
                 html.Div("No custom tickers added yet.",
@@ -540,7 +691,7 @@ def universe_card(r):
             ]),
             html.Div([
                 html.Span(str(score),style={"fontSize":"20px","fontWeight":"900","color":sc,"marginRight":"8px"}),
-                html.Span(state.replace("_"," ").upper(),
+                html.Span(STATE_LABEL.get(state, state.replace('_',' ').title()),
                     style={"background":color,"color":"white","fontSize":"9px",
                            "padding":"3px 8px","borderRadius":"8px","fontWeight":"700"}),
             ],style={"display":"flex","alignItems":"center"}),
@@ -624,7 +775,7 @@ def tsx_sector_section(rows):
                     ]),
                     html.Div([
                         html.Span(str(score),style={"fontSize":"18px","fontWeight":"900","color":sc,"marginRight":"6px"}),
-                        html.Span(state.replace("_"," ").upper(),
+                        html.Span(STATE_LABEL.get(state, state.replace('_',' ').title()),
                             style={"background":color,"color":"white","fontSize":"8px",
                                    "padding":"2px 6px","borderRadius":"6px","fontWeight":"700"}),
                     ],style={"display":"flex","alignItems":"center"}),
@@ -783,6 +934,7 @@ app.layout=html.Div([
     dcc.Store(id="live-prices",data={}),  # ticker -> live price (float)
     dcc.Store(id="alert-signals",data=[]),  # current GET IN signals
     dcc.Store(id="show-all-grid",data=False),  # toggle quiet stocks
+    dcc.Store(id="pending-trade",data=None),   # trade ticket awaiting confirmation
     html.Div([
         html.Div([
             html.H1("🌊 Tsunami",style={"margin":"0","fontSize":"26px","fontWeight":"800","color":TEXT_PRI}),
@@ -801,7 +953,8 @@ app.layout=html.Div([
         dcc.Tab(label="📊 Grid",value="grid",style=TAB_STYLE,selected_style=TAB_SEL),
         dcc.Tab(label="🧠 Intelligence",value="intelligence",style=TAB_STYLE,selected_style=TAB_SEL),
         dcc.Tab(label="📋 Validation",value="validation",style=TAB_STYLE,selected_style=TAB_SEL),
-        dcc.Tab(label="⚡ Trades",value="trades",style=TAB_STYLE,selected_style=TAB_SEL),
+        dcc.Tab(label="➕ Add Assets",value="trades",style=TAB_STYLE,selected_style=TAB_SEL),
+        dcc.Tab(label="📝 Paper",value="paper",style=TAB_STYLE,selected_style=TAB_SEL),
         dcc.Tab(label="🔭 Universe",value="universe",style=TAB_STYLE,selected_style=TAB_SEL),
         dcc.Tab(id="alerts-tab",label="🚨 Alerts",value="alerts",style=TAB_STYLE,selected_style={**TAB_SEL,"background":"#b71c1c","borderColor":"#ef5350"}),
     ],style={"marginBottom":"0"},colors={"border":BORDER,"primary":ACCENT,"background":BG_PANEL}),
@@ -819,7 +972,8 @@ _price_thread_started = False
 def _price_worker() -> None:
     """
     Background daemon: fetches fast_info.last_price for every ticker in
-    all-rows every 3 minutes. Writes results into _live_price_cache.
+    all-rows every 15 minutes. Writes results into _live_price_cache.
+    Also monitors open paper trades for exit conditions.
     Never raises — failures are silently skipped so the grid is never broken.
     """
     import yfinance as yf
@@ -835,6 +989,37 @@ def _price_worker() -> None:
                             _live_price_cache[ticker] = float(price)
                 except Exception:
                     pass  # leave stale value in cache; never crash the thread
+
+            # Monitor open paper trades for exit conditions
+            try:
+                open_trades = load_open_paper_trades()
+                state_map   = {r["ticker"]: r for r in rows}
+                today       = date.today()
+                with _price_cache_lock:
+                    live_snapshot = dict(_live_price_cache)
+
+                for trade in open_trades:
+                    ticker     = trade["ticker"]
+                    price      = live_snapshot.get(ticker) or 0
+                    stop       = trade["stop_price"]
+                    direction  = trade["direction"]
+                    entry_date = date.fromisoformat(trade["entry_date"])
+                    days_held  = (today - entry_date).days
+                    stage      = state_map.get(ticker, {}).get("stage", 0)
+                    exit_reason = None
+
+                    if direction == "long" and price > 0 and price <= stop:
+                        exit_reason = f"🛑 Price hit stop loss ({price:.2f})"
+                    elif days_held >= 10:
+                        exit_reason = f"⏱ 10-day limit reached"
+                    elif stage < 2 and days_held >= 3:
+                        exit_reason = "📉 Regime ended"
+
+                    if exit_reason and price > 0:
+                        close_paper_trade(trade["id"], price, exit_reason)
+            except Exception:
+                pass
+
         except Exception:
             pass
         time.sleep(15 * 60)  # 15-minute cadence — matches price-poll interval
@@ -886,6 +1071,190 @@ def toggle_show_all(n, current):
     if not n: raise PreventUpdate
     return not current
 
+@app.callback(
+    Output("pending-trade","data"),
+    Output("main-tabs","value"),
+    Input({"type":"paper-enter","ticker":ALL},"n_clicks"),
+    State("alert-signals","data"),
+    prevent_initial_call=True,
+)
+def enter_paper_trade(n_clicks_list, alert_data):
+    """Stage a paper trade from alert — shows trade ticket."""
+    if not ctx.triggered or not any(v for v in n_clicks_list if v):
+        raise PreventUpdate
+    tid = ctx.triggered_id
+    if not tid or not isinstance(tid, dict): raise PreventUpdate
+    ticker = tid.get("ticker","")
+    if not ticker: raise PreventUpdate
+    entry_signals = []
+    if isinstance(alert_data, dict): entry_signals = alert_data.get("entry", [])
+    elif isinstance(alert_data, list): entry_signals = alert_data
+    sig = next((s for s in entry_signals if s["ticker"] == ticker), None)
+    if not sig: raise PreventUpdate
+    live  = get_live_price_snapshot()
+    price = live.get(ticker) or sig.get("price") or 0
+    if price <= 0: raise PreventUpdate
+    try: atr = get_atr(ticker) or price * 0.02
+    except: atr = price * 0.02
+    direction  = sig.get("direction","long")
+    conviction = sig.get("conviction", 50)
+    portfolio  = get_portfolio_value()
+    stop_price = (price - atr*ATR_MULT) if direction=="long" else (price + atr*ATR_MULT)
+    sizing     = position_size(price, stop_price, conviction, portfolio)
+    pending = {"ticker":ticker,"direction":direction,"stage":sig.get("stage",0),
+               "conviction":conviction,"entry_price":round(price,4),"stop_price":round(stop_price,4),
+               "atr":round(atr,4),"shares":sizing["shares"],"dollar_risk":sizing["dollar_risk"],
+               "position_value":sizing["position_value"],"risk_pct":sizing["risk_pct"]}
+    return pending, "paper"
+
+@app.callback(
+    Output("pending-trade","data", allow_duplicate=True),
+    Output("main-tabs","value", allow_duplicate=True),
+    Input({"type":"paper-from-detail","ticker":ALL},"n_clicks"),
+    State("all-rows","data"),
+    prevent_initial_call=True,
+)
+def paper_trade_from_detail(n_clicks_list, rows):
+    """Stage a paper trade from detail panel — shows trade ticket."""
+    if not ctx.triggered or not any(v for v in n_clicks_list if v):
+        raise PreventUpdate
+    tid = ctx.triggered_id
+    if not tid or not isinstance(tid, dict): raise PreventUpdate
+    ticker = tid.get("ticker","")
+    if not ticker: raise PreventUpdate
+    row = next((r for r in (rows or []) if r["ticker"] == ticker), None)
+    if not row:
+        rows = load_latest()
+        row  = next((r for r in rows if r["ticker"] == ticker), None)
+    if not row: raise PreventUpdate
+    live  = get_live_price_snapshot()
+    price = live.get(ticker) or row.get("price") or 0
+    if price <= 0: raise PreventUpdate
+    try: atr = get_atr(ticker) or price * 0.02
+    except: atr = price * 0.02
+    conviction = conviction_score(row)
+    portfolio  = get_portfolio_value()
+    stop_price = price - atr * ATR_MULT
+    sizing     = position_size(price, stop_price, conviction, portfolio)
+    pending = {"ticker":ticker,"direction":"long","stage":row.get("stage",0),
+               "conviction":conviction,"entry_price":round(price,4),"stop_price":round(stop_price,4),
+               "atr":round(atr,4),"shares":sizing["shares"],"dollar_risk":sizing["dollar_risk"],
+               "position_value":sizing["position_value"],"risk_pct":sizing["risk_pct"]}
+    return pending, "paper"
+
+@app.callback(
+    Output("ticket-live-calc","children"),
+    Input("ticket-price","value"),
+    Input("ticket-shares","value"),
+    Input("ticket-stop","value"),
+    State("ticket-data","data"),
+    prevent_initial_call=True,
+)
+def update_ticket_calc(price, shares, stop, ticket_data):
+    """Live-update the calculated totals as user edits ticket fields."""
+    if not price or not shares or not stop or not ticket_data:
+        raise PreventUpdate
+    try:
+        p  = float(price)
+        sh = float(shares)
+        st = float(stop)
+        ticker    = ticket_data.get("ticker","")
+        direction = ticket_data.get("direction","long")
+        pos_val   = p * sh
+        risk_amt  = abs(p - st) * sh
+        is_long   = direction == "long"
+        pnl_at_stop = (st - p) * sh if is_long else (p - st) * sh
+        pnl_color = "#00e676" if pnl_at_stop >= 0 else "#ef5350"
+
+        return html.Div([
+            html.Div([
+                html.Div([
+                    html.Span("Total Cost  ", style={"color":TEXT_DIM,"fontSize":"12px"}),
+                    html.Span(fmt_price(pos_val, ticker),
+                        style={"fontSize":"20px","fontWeight":"900","color":TEXT_PRI}),
+                ]),
+                html.Div([
+                    html.Span("Max Loss  ", style={"color":TEXT_DIM,"fontSize":"12px"}),
+                    html.Span(f"-{fmt_price(risk_amt, ticker)}",
+                        style={"fontSize":"20px","fontWeight":"900","color":"#ef5350"}),
+                ]),
+                html.Div([
+                    html.Span("P&L at Stop  ", style={"color":TEXT_DIM,"fontSize":"12px"}),
+                    html.Span(f"{'+' if pnl_at_stop>=0 else ''}{fmt_price(abs(pnl_at_stop), ticker)}",
+                        style={"fontSize":"20px","fontWeight":"900","color":pnl_color}),
+                ]),
+            ], style={"display":"flex","gap":"24px","alignItems":"center",
+                      "background":BG_DEEP,"borderRadius":"8px","padding":"14px 18px",
+                      "border":f"1px solid {BORDER}"}),
+        ])
+    except Exception:
+        raise PreventUpdate
+
+@app.callback(
+    Output("tab-content","children", allow_duplicate=True),
+    Input({"type":"close-paper-trade","trade_id":ALL},"n_clicks"),
+    prevent_initial_call=True,
+)
+def close_paper_trade_cb(n_clicks_list):
+    if not ctx.triggered or not any(v for v in n_clicks_list if v):
+        raise PreventUpdate
+    tid = ctx.triggered_id
+    if not tid or not isinstance(tid, dict): raise PreventUpdate
+    trade_id = tid.get("trade_id")
+    if not trade_id: raise PreventUpdate
+    live  = get_live_price_snapshot()
+    # Get trade to find ticker
+    open_trades = load_open_paper_trades()
+    trade = next((t for t in open_trades if t["id"] == trade_id), None)
+    if not trade: raise PreventUpdate
+    price = live.get(trade["ticker"]) or trade["entry_price"]
+    close_paper_trade(trade_id, price, "👤 Manually closed")
+    return build_paper_tab(None)
+
+@app.callback(
+    Output("pending-trade","data", allow_duplicate=True),
+    Output("tab-content","children", allow_duplicate=True),
+    Output("ticket-status","children"),
+    Input("ticket-confirm-btn","n_clicks"),
+    Input("ticket-cancel-btn","n_clicks"),
+    State("ticket-data","data"),
+    State("ticket-price","value"),
+    State("ticket-shares","value"),
+    State("ticket-stop","value"),
+    State("ticket-note","value"),
+    prevent_initial_call=True,
+)
+def handle_ticket(confirm_clicks, cancel_clicks, ticket_data,
+                  price, shares, stop, note):
+    """Handle confirm or cancel on the trade ticket."""
+    triggered = ctx.triggered_id
+    if triggered == "ticket-cancel-btn":
+        return None, build_paper_tab(None), ""
+
+    if triggered == "ticket-confirm-btn" and ticket_data:
+        if not price or not shares or not stop:
+            return ticket_data, build_paper_tab(ticket_data), "❌ Please fill in all price fields"
+        try:
+            atr = ticket_data.get("atr", abs(float(price) - float(stop)) / ATR_MULT)
+            sizing = position_size(float(price), float(stop),
+                                   ticket_data.get("conviction",50), get_portfolio_value())
+            open_paper_trade(
+                ticker         = ticket_data["ticker"],
+                direction      = ticket_data["direction"],
+                stage          = ticket_data.get("stage",0),
+                conviction     = ticket_data.get("conviction",50),
+                entry_price    = round(float(price),4),
+                stop_price     = round(float(stop),4),
+                atr            = round(float(atr),4),
+                shares         = round(float(shares),2),
+                dollar_risk    = round(float(shares) * abs(float(price)-float(stop)),2),
+                position_value = round(float(shares) * float(price),2),
+            )
+            return None, build_paper_tab(None), ""
+        except Exception as e:
+            return ticket_data, build_paper_tab(ticket_data), f"❌ Error: {str(e)[:60]}"
+    raise PreventUpdate
+
 @app.callback(Output("live-prices","data"),Input("price-poll","n_intervals"))
 def update_live_prices(_):
     """Drain the background thread's cache into the Dash store every 3 min."""
@@ -894,9 +1263,9 @@ def update_live_prices(_):
 @app.callback(
     Output("tab-content","children"),
     Input("main-tabs","value"),Input("all-rows","data"),Input("selected-ticker","data"),
-    Input("live-prices","data"),Input("show-all-grid","data"),
+    Input("live-prices","data"),Input("show-all-grid","data"),Input("pending-trade","data"),
 )
-def render_tab(tab,rows,selected_ticker,live_prices,show_all):
+def render_tab(tab,rows,selected_ticker,live_prices,show_all,pending_trade):
     if not rows:rows=load_latest()
     if tab=="intelligence":return build_intelligence_tab(rows)
     if tab=="validation":return build_validation_tab()
@@ -912,6 +1281,8 @@ def render_tab(tab,rows,selected_ticker,live_prices,show_all):
     if tab=="trades":
         fresh_rows=load_latest()
         return build_trades_tab(fresh_rows if fresh_rows else rows)
+    if tab=="paper":
+        return build_paper_tab(pending_trade)
     detail=html.Div()
     if selected_ticker:
         row=next((r for r in rows if r["ticker"]==selected_ticker),None)
@@ -924,9 +1295,11 @@ def render_tab(tab,rows,selected_ticker,live_prices,show_all):
         grid_rows=[{**r,"price":live_prices[r["ticker"]]} if r["ticker"] in live_prices else r
                    for r in grid_rows]
     # Filter quiet/neutral unless show-all toggled
-    QUIET_STATES = {"neutral","insufficient_data","compressed","coiling"}
-    active_rows = [r for r in grid_rows if r.get("state","neutral") not in QUIET_STATES]
-    quiet_rows  = [r for r in grid_rows if r.get("state","neutral") in QUIET_STATES]
+    QUIET_STATES   = {"neutral","insufficient_data","compressed","coiling"}
+    custom_tickers = {c["ticker"] for c in load_custom_tickers()}
+    # Custom stocks always show — quiet filter only applies to default watchlist
+    active_rows  = [r for r in grid_rows if r.get("state","neutral") not in QUIET_STATES or r["ticker"] in custom_tickers]
+    quiet_rows   = [r for r in grid_rows if r.get("state","neutral") in QUIET_STATES and r["ticker"] not in custom_tickers]
     display_rows = grid_rows if show_all else active_rows
     # Toggle button
     quiet_count = len(quiet_rows)
@@ -954,8 +1327,14 @@ def select_ticker(n_clicks_list,rows):
     if not ctx.triggered or not any(n_clicks_list):raise PreventUpdate
     triggered=ctx.triggered[0]
     if not triggered["value"]:raise PreventUpdate
-    idx=json.loads(triggered["prop_id"].split(".")[0])["index"]
-    if rows and idx<len(rows):return rows[idx]["ticker"]
+    safe_ticker=json.loads(triggered["prop_id"].split(".")[0])["index"]
+    # Reverse sanitization — __  was used to replace . ^ =
+    # Try direct match first, then try restoring dots
+    if rows:
+        for r in rows:
+            st = r["ticker"].replace(".","__").replace("^","__").replace("=","__")
+            if st == safe_ticker:
+                return r["ticker"]
     raise PreventUpdate
 
 @app.callback(
@@ -985,10 +1364,11 @@ def add_ticker(n,ticker,label):
             return f"❌ {ticker} not found — check the symbol", []
     except Exception:
         return f"❌ Could not verify {ticker}", []
-    # Check if already in default watchlist
-    wl=get_full_watchlist()
-    if ticker in wl and ticker not in [c["ticker"] for c in load_custom_tickers()]:
-        return f"ℹ️ {ticker} is already in the default watchlist", []
+    # Check if already added as custom
+    custom_tickers = [c["ticker"] for c in load_custom_tickers()]
+    if ticker in custom_tickers:
+        return f"ℹ️ {ticker} is already in your custom list", []
+    # Add it — even if it's in the default watchlist, adding as custom pins it to grid
     success=add_custom_ticker(ticker,label or ticker)
     if success:
         try:
@@ -996,26 +1376,31 @@ def add_ticker(n,ticker,label):
         except Exception:
             pass
         rows=load_latest()
+        wl=get_full_watchlist()
+        if ticker in wl:
+            return f"✅ {ticker} pinned to your grid (was already being scanned)", rows
         return f"✅ {ticker} added and scanned", rows
     return f"❌ Could not add {ticker}", []
 
 @app.callback(
     Output("all-rows","data",allow_duplicate=True),
-    Input({"type":"remove-ticker","index":ALL,"ticker":ALL},"n_clicks"),
+    Input({"type":"remove-ticker","index":ALL},"n_clicks"),
     prevent_initial_call=True,
 )
 def remove_ticker_cb(n_clicks_list):
     if not ctx.triggered or not any((v for v in n_clicks_list if v)):raise PreventUpdate
     triggered=ctx.triggered[0]
     if not triggered["value"]:raise PreventUpdate
-    # Get ticker from the triggered component's id dict
-    prop_id=triggered["prop_id"]
-    # ctx.triggered_id is cleaner
     if ctx.triggered_id and isinstance(ctx.triggered_id, dict):
-        ticker=ctx.triggered_id.get("ticker","")
+        # safe_id has dots replaced with _ — recover original ticker from custom list
+        safe_id = ctx.triggered_id.get("index","")
+        custom  = load_custom_tickers()
+        ticker  = next((c["ticker"] for c in custom
+                        if c["ticker"].replace(".","_").replace("^","_").replace("=","_") == safe_id), None)
+        if not ticker:
+            raise PreventUpdate
     else:
         raise PreventUpdate
-    if not ticker:raise PreventUpdate
     from tsunami_trades import remove_custom_ticker
     remove_custom_ticker(ticker)
     rows=load_latest()
@@ -1074,9 +1459,300 @@ def promote_to_watchlist(n_clicks_list):
     tab = build_universe_tab()
     return tab
 
-# ---------------------------------------------------------------------------
-# Alert page — standalone HTML served at /alert/<ticker>
-# ---------------------------------------------------------------------------
+def build_trade_ticket(pending: dict) -> html.Div:
+    """Editable trade ticket shown at top of Paper tab when a trade is pending."""
+    if not pending:
+        return html.Div()
+
+    ticker    = pending.get("ticker","")
+    direction = pending.get("direction","long")
+    price     = pending.get("entry_price", 0)
+    stop      = pending.get("stop_price", 0)
+    shares    = pending.get("shares", 0)
+    risk      = pending.get("dollar_risk", 0)
+    pos_val   = pending.get("position_value", 0)
+    conviction= pending.get("conviction", 0)
+    wl        = get_full_watchlist()
+    label     = wl.get(ticker,{}).get("label", ticker)
+    is_long   = direction == "long"
+    ac        = "#00e676" if is_long else "#ff1744"
+
+    return html.Div([
+        html.Div("📋 New Trade Ticket", style={"fontSize":"16px","fontWeight":"700",
+            "color":"#00e676","marginBottom":"4px"}),
+        html.Div("Review and adjust before confirming. All fields are editable.",
+            style={"color":TEXT_DIM,"fontSize":"12px","marginBottom":"20px"}),
+
+        # Asset + direction header
+        html.Div([
+            html.Div([
+                html.Span(ticker, style={"fontSize":"22px","fontWeight":"900","color":TEXT_PRI,"marginRight":"10px"}),
+                html.Span(label,  style={"fontSize":"14px","color":TEXT_SEC}),
+            ]),
+            html.Div([
+                html.Button("Buying",
+                    id="ticket-long-btn", n_clicks=0,
+                    style={"background":"#00e676" if is_long else BG_DEEP,
+                           "color":"#080b12" if is_long else TEXT_DIM,
+                           "border":"1px solid #00e676","borderRadius":"6px 0 0 6px",
+                           "padding":"8px 18px","cursor":"pointer","fontWeight":"700","fontSize":"13px"}),
+                html.Button("Selling",
+                    id="ticket-short-btn", n_clicks=0,
+                    style={"background":"#ff1744" if not is_long else BG_DEEP,
+                           "color":"white" if not is_long else TEXT_DIM,
+                           "border":"1px solid #ff1744","borderRadius":"0 6px 6px 0",
+                           "padding":"8px 18px","cursor":"pointer","fontWeight":"700","fontSize":"13px"}),
+            ], style={"display":"flex"}),
+        ], style={"display":"flex","justifyContent":"space-between","alignItems":"center","marginBottom":"20px"}),
+
+        # Editable fields grid
+        html.Div([
+            # Entry price
+            html.Div([
+                html.Div("Entry Price", style={"fontSize":"11px","color":TEXT_DIM,"marginBottom":"6px","textTransform":"uppercase"}),
+                dcc.Input(id="ticket-price", type="number", value=round(price,4),
+                    style={"background":BG_DEEP,"color":TEXT_PRI,"border":f"1px solid {BORDER}",
+                           "borderRadius":"6px","padding":"10px 12px","fontSize":"16px",
+                           "fontWeight":"700","width":"100%","outline":"none"}),
+            ], style={"flex":"1"}),
+
+            # Shares
+            html.Div([
+                html.Div("Shares", style={"fontSize":"11px","color":TEXT_DIM,"marginBottom":"6px","textTransform":"uppercase"}),
+                dcc.Input(id="ticket-shares", type="number", value=round(shares,2),
+                    style={"background":BG_DEEP,"color":"#f57c00","border":f"1px solid {BORDER}",
+                           "borderRadius":"6px","padding":"10px 12px","fontSize":"16px",
+                           "fontWeight":"700","width":"100%","outline":"none"}),
+            ], style={"flex":"1"}),
+
+            # Stop price
+            html.Div([
+                html.Div("Stop Price", style={"fontSize":"11px","color":TEXT_DIM,"marginBottom":"6px","textTransform":"uppercase"}),
+                dcc.Input(id="ticket-stop", type="number", value=round(stop,4),
+                    style={"background":BG_DEEP,"color":"#ef5350","border":f"1px solid {BORDER}",
+                           "borderRadius":"6px","padding":"10px 12px","fontSize":"16px",
+                           "fontWeight":"700","width":"100%","outline":"none"}),
+            ], style={"flex":"1"}),
+        ], style={"display":"flex","gap":"12px","marginBottom":"16px"}),
+
+        # Calculated summary row
+        html.Div([
+            html.Div([
+                html.Div("Position Value", style={"fontSize":"10px","color":TEXT_DIM,"marginBottom":"4px"}),
+                html.Div(fmt_price(pos_val, ticker), style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI}),
+            ], style={"background":BG_DEEP,"borderRadius":"8px","padding":"12px","textAlign":"center","flex":"1"}),
+            html.Div([
+                html.Div("Dollar Risk", style={"fontSize":"10px","color":TEXT_DIM,"marginBottom":"4px"}),
+                html.Div(fmt_price(risk, ticker), style={"fontSize":"16px","fontWeight":"700","color":"#ab47bc"}),
+            ], style={"background":BG_DEEP,"borderRadius":"8px","padding":"12px","textAlign":"center","flex":"1"}),
+            html.Div([
+                html.Div("Conviction", style={"fontSize":"10px","color":TEXT_DIM,"marginBottom":"4px"}),
+                html.Div(str(conviction), style={"fontSize":"16px","fontWeight":"700","color":score_color(conviction)}),
+            ], style={"background":BG_DEEP,"borderRadius":"8px","padding":"12px","textAlign":"center","flex":"1"}),
+            html.Div([
+                html.Div("Risk %", style={"fontSize":"10px","color":TEXT_DIM,"marginBottom":"4px"}),
+                html.Div(f"{pending.get('risk_pct',0)*100:.1f}%",
+                    style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI}),
+            ], style={"background":BG_DEEP,"borderRadius":"8px","padding":"12px","textAlign":"center","flex":"1"}),
+        ], style={"display":"flex","gap":"10px","marginBottom":"12px"}),
+
+        # Live calculated totals — updates as you type
+        html.Div(id="ticket-live-calc", style={"marginBottom":"16px"}),
+
+        # Note field
+        html.Div([
+            html.Div("Trade Note (optional)", style={"fontSize":"11px","color":TEXT_DIM,"marginBottom":"6px","textTransform":"uppercase"}),
+            dcc.Input(id="ticket-note", type="text", placeholder="e.g. Post-earnings compression play...",
+                style={"background":BG_DEEP,"color":TEXT_PRI,"border":f"1px solid {BORDER}",
+                       "borderRadius":"6px","padding":"10px 12px","fontSize":"13px",
+                       "width":"100%","outline":"none"}),
+        ], style={"marginBottom":"20px"}),
+
+        # Action buttons
+        html.Div([
+            html.Button("✅ Confirm Paper Trade",
+                id="ticket-confirm-btn", n_clicks=0,
+                style={"background":"#00e676","color":"#080b12","border":"none","borderRadius":"8px",
+                       "padding":"12px 28px","cursor":"pointer","fontWeight":"900",
+                       "fontSize":"15px","flex":"2"}),
+            html.Button("✕ Cancel",
+                id="ticket-cancel-btn", n_clicks=0,
+                style={"background":"none","color":TEXT_DIM,"border":f"1px solid {BORDER}",
+                       "borderRadius":"8px","padding":"12px 20px","cursor":"pointer",
+                       "fontWeight":"600","fontSize":"13px","marginLeft":"10px","flex":"1"}),
+        ], style={"display":"flex"}),
+
+        html.Div(id="ticket-status", style={"color":TEXT_DIM,"fontSize":"12px","marginTop":"8px","textAlign":"center"}),
+
+        # Hidden store with original trade data
+        dcc.Store(id="ticket-data", data=pending),
+
+    ], style={"background":BG_CARD,"border":f"2px solid #00e67640","borderLeft":"4px solid #00e676",
+              "borderRadius":"12px","padding":"24px","marginBottom":"24px"})
+
+def build_paper_tab(pending: dict = None) -> html.Div:
+    """Paper trading tab — simulated trades with live price tracking."""
+    ticket        = build_trade_ticket(pending) if pending else html.Div()
+    open_trades   = load_open_paper_trades()
+    closed_trades = load_closed_paper_trades()
+    scorecard     = paper_trade_scorecard()
+    live          = get_live_price_snapshot()
+
+    # ── Scorecard ──
+    sc_items = []
+    if scorecard["closed"] > 0:
+        pf_str = f"{scorecard['profit_factor']}" if scorecard["profit_factor"] else "—"
+        sc_items = [
+            ("Trades", f"{scorecard['closed']} closed / {scorecard['open']} open"),
+            ("Win Rate", f"{scorecard['win_rate']}%"),
+            ("Total P&L", f"{'+'if scorecard['total_pnl']>=0 else ''}{scorecard['total_pnl']:,.2f}"),
+            ("Profit Factor", pf_str),
+            ("Mean Return", f"{scorecard['mean_pct']:+.2f}% / trade"),
+        ]
+    sc_cards = [html.Div([
+        html.Div(label, style={"fontSize":"10px","color":TEXT_DIM,"textTransform":"uppercase","marginBottom":"4px"}),
+        html.Div(value, style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI}),
+    ], style={"background":BG_DEEP,"borderRadius":"8px","padding":"12px 16px","textAlign":"center"})
+    for label, value in sc_items] if sc_items else [
+        html.Div("No closed trades yet — enter your first paper trade from the Alerts tab.",
+            style={"color":TEXT_DIM,"fontSize":"13px","fontStyle":"italic","padding":"20px 0"})
+    ]
+
+    # ── Open positions ──
+    open_rows = []
+    for t in open_trades:
+        ticker     = t["ticker"]
+        live_price = live.get(ticker) or t["entry_price"]
+        entry      = t["entry_price"]
+        shares     = t["shares"]
+        stop       = t["stop_price"]
+        direction  = t["direction"]
+        if direction == "long":
+            upnl     = (live_price - entry) * shares
+            upnl_pct = (live_price / entry - 1) * 100
+        else:
+            upnl     = (entry - live_price) * shares
+            upnl_pct = (entry / live_price - 1) * 100
+        pnl_color = "#00e676" if upnl >= 0 else "#ff1744"
+        days_held = (date.today() - date.fromisoformat(t["entry_date"])).days
+
+        open_rows.append(html.Div([
+            # Header row — ticker, direction, close button
+            html.Div([
+                html.Div([
+                    html.Span(ticker, style={"fontWeight":"700","color":TEXT_PRI,"fontSize":"15px","marginRight":"8px"}),
+                    html.Span("Buying" if direction=="long" else "Selling",
+                        style={"background":"#1a3a2a" if direction=="long" else "#3a1a1a",
+                        "color":"#00e676" if direction=="long" else "#ff1744",
+                        "fontSize":"10px","padding":"3px 10px","borderRadius":"4px","fontWeight":"700","marginRight":"8px"}),
+                    html.Span(f"conv:{t['conviction']}", style={"color":TEXT_DIM,"fontSize":"11px"}),
+                    html.Span(f"  ·  Day {days_held}", style={"color":TEXT_DIM,"fontSize":"11px"}),
+                ], style={"display":"flex","alignItems":"center"}),
+                html.Button("✕ Close",
+                    id={"type":"close-paper-trade","trade_id":t["id"]},
+                    n_clicks=0,
+                    style={"background":"none","border":f"1px solid #ef535050","color":"#ef5350",
+                           "borderRadius":"6px","padding":"4px 10px","cursor":"pointer",
+                           "fontSize":"11px","fontWeight":"600"}),
+            ], style={"display":"flex","justifyContent":"space-between","alignItems":"center","marginBottom":"12px"}),
+
+            # Price row
+            html.Div([
+                html.Div([
+                    html.Div("Entry Price", style={"fontSize":"9px","color":TEXT_DIM,"marginBottom":"3px","textTransform":"uppercase"}),
+                    html.Div(fmt_price(entry,ticker), style={"fontSize":"15px","fontWeight":"700","color":TEXT_PRI}),
+                ], style={"background":BG_DEEP,"borderRadius":"6px","padding":"10px","textAlign":"center","flex":"1"}),
+                html.Div([
+                    html.Div("Live Price", style={"fontSize":"9px","color":TEXT_DIM,"marginBottom":"3px","textTransform":"uppercase"}),
+                    html.Div(fmt_price(live_price,ticker), style={"fontSize":"15px","fontWeight":"700","color":pnl_color}),
+                ], style={"background":BG_DEEP,"borderRadius":"6px","padding":"10px","textAlign":"center","flex":"1"}),
+                html.Div([
+                    html.Div("Stop Price", style={"fontSize":"9px","color":TEXT_DIM,"marginBottom":"3px","textTransform":"uppercase"}),
+                    html.Div(fmt_price(stop,ticker), style={"fontSize":"15px","fontWeight":"700","color":"#ef5350"}),
+                ], style={"background":BG_DEEP,"borderRadius":"6px","padding":"10px","textAlign":"center","flex":"1"}),
+            ], style={"display":"flex","gap":"8px","marginBottom":"8px"}),
+
+            # P&L row — clearly labelled
+            html.Div([
+                html.Span("Unrealised P&L  ", style={"color":TEXT_DIM,"fontSize":"12px"}),
+                html.Span(f"{'+'if upnl>=0 else ''}{upnl:,.2f}",
+                    style={"fontSize":"20px","fontWeight":"900","color":pnl_color,"marginRight":"8px"}),
+                html.Span(f"({upnl_pct:+.1f}%)",
+                    style={"fontSize":"14px","fontWeight":"600","color":pnl_color}),
+                html.Span(f"  ·  {shares:,.1f} shares  ·  Position: {fmt_price(entry*shares,ticker)}",
+                    style={"color":TEXT_DIM,"fontSize":"11px","marginLeft":"8px"}),
+            ], style={"display":"flex","alignItems":"center","padding":"8px 0","borderTop":f"1px solid {BORDER}"}),
+
+        ], style={"background":BG_CARD,"border":f"1px solid #00e67630","borderLeft":"3px solid #00e676",
+            "borderRadius":"8px","padding":"14px","marginBottom":"10px"}))
+
+    # ── Closed trades ──
+    def clean_exit(reason: str) -> str:
+        if not reason: return "—"
+        r = reason.lower()
+        if "stop hit" in r:      return "🛑 Price hit stop loss"
+        if "stage collapsed" in r or "stage collapse" in r: return "📉 Regime ended"
+        if "time stop" in r:     return "⏱ 10-day limit reached"
+        if "manually" in r:      return "👤 Manually closed"
+        if "end of period" in r: return "⏹ Period ended"
+        return reason[:30]
+
+    closed_rows = []
+    for t in closed_trades[:20]:
+        pnl   = t.get("pnl") or 0
+        pct   = t.get("pnl_pct") or 0
+        color = "#00e676" if pnl >= 0 else "#ff1744"
+        result= "✅" if pnl >= 0 else "❌"
+        dir_label = "Buying" if t["direction"] == "long" else "Selling"
+        closed_rows.append(html.Tr([
+            html.Td(t["entry_date"], style={"padding":"8px","color":TEXT_DIM,"fontSize":"12px"}),
+            html.Td(t["ticker"],     style={"padding":"8px","color":TEXT_PRI,"fontWeight":"700","fontSize":"12px"}),
+            html.Td(dir_label,       style={"padding":"8px","color":TEXT_SEC,"fontSize":"11px"}),
+            html.Td(str(t["conviction"]), style={"padding":"8px","color":TEXT_DIM,"fontSize":"11px"}),
+            html.Td(fmt_price(t["entry_price"],t["ticker"]), style={"padding":"8px","color":TEXT_PRI,"fontSize":"12px"}),
+            html.Td(fmt_price(t.get("exit_price"),t["ticker"]), style={"padding":"8px","color":TEXT_PRI,"fontSize":"12px"}),
+            html.Td(f"{'+'if pnl>=0 else ''}{pnl:,.2f}", style={"padding":"8px","color":color,"fontWeight":"700","fontSize":"12px"}),
+            html.Td(f"{pct:+.1f}%", style={"padding":"8px","color":color,"fontSize":"12px"}),
+            html.Td(f"{result} {clean_exit(t.get('exit_reason',''))}", style={"padding":"8px","color":TEXT_DIM,"fontSize":"11px"}),
+        ], style={"borderBottom":f"1px solid {BORDER}"}))
+
+    th_s = {"padding":"8px","color":TEXT_DIM,"fontSize":"10px","textTransform":"uppercase",
+            "fontWeight":"700","borderBottom":f"1px solid {BORDER}","textAlign":"left"}
+
+    return html.Div([
+        html.Div("📝 Paper Trading", style={"fontSize":"18px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"4px"}),
+        html.Div("Simulated trades using 15-min delayed prices. Enter trades from the 🚨 Alerts tab or any asset card.",
+            style={"color":TEXT_DIM,"fontSize":"12px","marginBottom":"24px"}),
+
+        # Trade ticket — shown when a pending trade is waiting for confirmation
+        ticket,
+
+        # Scorecard
+        html.Div(sc_cards, style={"display":"flex","gap":"10px","marginBottom":"24px","flexWrap":"wrap"}),
+
+        # Open positions
+        html.Div([
+            html.Div(f"📈 Open Positions ({len(open_trades)})",
+                style={"fontSize":"14px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"12px"}),
+            *(open_rows if open_rows else [
+                html.Div("No open paper trades. Enter a trade from the Alerts tab when a signal fires.",
+                    style={"color":TEXT_DIM,"fontSize":"13px","fontStyle":"italic","padding":"16px 0"})
+            ]),
+        ], style={"background":BG_CARD,"borderRadius":"10px","padding":"20px","marginBottom":"20px"}),
+
+        # Closed trades
+        html.Div([
+            html.Div(f"📋 Closed Trades ({len(closed_trades)})",
+                style={"fontSize":"14px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"12px"}),
+            html.Table([
+                html.Tr([html.Th(c, style=th_s) for c in ["Date","Ticker","Dir","Conv","Entry","Exit","P&L","%","Reason"]]),
+                *(closed_rows if closed_rows else [
+                    html.Tr([html.Td("No closed trades yet",
+                        style={"padding":"20px","color":TEXT_DIM,"textAlign":"center","fontStyle":"italic"})])
+                ])
+            ], style={"width":"100%","borderCollapse":"collapse"}),
+        ], style={"background":BG_CARD,"borderRadius":"10px","padding":"20px"}),
+    ])
 
 def _alert_page_html(sig: dict) -> str:
     """Generate a self-contained HTML alert page for one trade signal."""
@@ -1139,7 +1815,7 @@ def _alert_page_html(sig: dict) -> str:
 <div class="card">
   <div class="action pulse">{action_text}</div>
   <div class="ticker">{ticker}</div>
-  <div class="label">{label} · Stage {stage} · {state.replace("_"," ").upper()}</div>
+  <div class="label">{label} · Stage {stage} · {STATE_LABEL.get(state, state.replace('_',' ').title())}</div>
 
   <div class="grid">
     <div class="cell">
@@ -1446,7 +2122,7 @@ def build_alerts_tab(entry_signals: list[dict], exit_signals: list[dict]) -> htm
                     "letterSpacing":"1px","marginBottom":"6px"}),
                 html.Div(f"{label} ({ticker})",
                     style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"2px"}),
-                html.Div(f"Stage {stage} · {state.replace('_',' ').upper()} · Conviction {conviction}/100",
+                html.Div(f"Stage {stage} · {STATE_LABEL.get(state, state.replace('_',' ').title())} · Conviction {conviction}/100",
                     style={"fontSize":"12px","color":TEXT_SEC,"marginBottom":"18px"}),
                 html.Div([
                     html.Div([html.Div("Entry",style={"fontSize":"10px","color":TEXT_DIM,"marginBottom":"4px"}),
@@ -1462,10 +2138,18 @@ def build_alerts_tab(entry_signals: list[dict], exit_signals: list[dict]) -> htm
                         html.Div(fmt_p(risk_amt),style={"fontSize":"18px","fontWeight":"800","color":"#ab47bc"})],
                         style={"background":BG_DEEP,"borderRadius":"8px","padding":"10px","textAlign":"center","flex":"1"}),
                 ],style={"display":"flex","gap":"10px","marginBottom":"14px"}),
+                html.Div([
                 html.A("🚨 Open Full Alert →", href=f"/alert/{ticker}", target="_blank",
                     style={"display":"block","background":ac,"color":"#080b12","fontWeight":"900",
                         "fontSize":"14px","textAlign":"center","padding":"12px","borderRadius":"8px",
-                        "textDecoration":"none","letterSpacing":"1px"}),
+                        "textDecoration":"none","letterSpacing":"1px","flex":"1"}),
+                html.Button("📝 Paper Trade",
+                    id={"type":"paper-enter","ticker":ticker},
+                    n_clicks=0,
+                    style={"background":"#1a3a2a","color":"#00e676","border":"1px solid #00e67640",
+                        "borderRadius":"8px","padding":"12px","cursor":"pointer","fontWeight":"700",
+                        "fontSize":"13px","marginLeft":"8px"}),
+                ], style={"display":"flex","gap":"8px"}),
             ],style={"background":BG_CARD,"border":f"2px solid {ac}","borderRadius":"12px",
                 "padding":"24px","marginBottom":"14px"}))
 

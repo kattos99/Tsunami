@@ -211,10 +211,31 @@ def init_trades_tables() -> None:
         )
     """)
 
-    # Default portfolio value
-    cur.execute("INSERT OR IGNORE INTO portfolio_config VALUES ('portfolio_value', ?)",
-                (str(DEFAULT_PORT),))
-    cur.execute("INSERT OR IGNORE INTO portfolio_config VALUES ('base_currency', 'CAD')",)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker          TEXT,
+            direction       TEXT,
+            stage           INTEGER,
+            conviction      INTEGER,
+            entry_date      TEXT,
+            entry_time      TEXT,
+            entry_price     REAL,
+            stop_price      REAL,
+            atr             REAL,
+            shares          REAL,
+            dollar_risk     REAL,
+            position_value  REAL,
+            exit_date       TEXT,
+            exit_time       TEXT,
+            exit_price      REAL,
+            exit_reason     TEXT,
+            pnl             REAL,
+            pnl_pct         REAL,
+            status          TEXT DEFAULT 'open',
+            notes           TEXT
+        )
+    """)
 
     con.commit()
     con.close()
@@ -492,4 +513,127 @@ def trade_summary() -> dict:
         "win_rate":  round(win_rate, 1),
         "mean_pnl":  round(sum(pnls) / len(pnls), 2),
         "total_pnl": round(sum(pnls), 2),
+    }
+
+
+# -----------------------------------------------------------------------
+# Paper trading
+# -----------------------------------------------------------------------
+
+def open_paper_trade(
+    ticker: str,
+    direction: str,
+    stage: int,
+    conviction: int,
+    entry_price: float,
+    stop_price: float,
+    atr: float,
+    shares: float,
+    dollar_risk: float,
+    position_value: float,
+) -> int:
+    """Log a new paper trade. Returns the trade ID."""
+    init_trades_tables()
+    now = date.today()
+    from datetime import datetime
+    now_str = datetime.now().strftime("%H:%M:%S")
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO paper_trades
+        (ticker, direction, stage, conviction, entry_date, entry_time,
+         entry_price, stop_price, atr, shares, dollar_risk, position_value, status)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open')
+    """, (ticker, direction, stage, conviction, now.isoformat(), now_str,
+          entry_price, stop_price, atr, shares, dollar_risk, position_value))
+    trade_id = cur.lastrowid
+    con.commit()
+    con.close()
+    return trade_id
+
+
+def close_paper_trade(trade_id: int, exit_price: float, exit_reason: str) -> None:
+    """Close an open paper trade."""
+    init_trades_tables()
+    from datetime import datetime
+    now_str = datetime.now().strftime("%H:%M:%S")
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute("SELECT * FROM paper_trades WHERE id=?", (trade_id,))
+    trade = dict(cur.fetchone())
+
+    direction = trade["direction"]
+    entry     = trade["entry_price"]
+    shares    = trade["shares"]
+
+    if direction == "long":
+        pnl     = (exit_price - entry) * shares
+        pnl_pct = (exit_price / entry - 1.0) * 100
+    else:
+        pnl     = (entry - exit_price) * shares
+        pnl_pct = (entry / exit_price - 1.0) * 100
+
+    cur.execute("""
+        UPDATE paper_trades SET exit_date=?, exit_time=?, exit_price=?,
+        exit_reason=?, pnl=?, pnl_pct=?, status='closed' WHERE id=?
+    """, (date.today().isoformat(), now_str, exit_price, exit_reason,
+          round(pnl, 2), round(pnl_pct, 2), trade_id))
+    con.commit()
+    con.close()
+
+
+def load_open_paper_trades() -> list[dict]:
+    init_trades_tables()
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute("SELECT * FROM paper_trades WHERE status='open' ORDER BY entry_date DESC, entry_time DESC")
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
+
+
+def load_closed_paper_trades() -> list[dict]:
+    init_trades_tables()
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute("SELECT * FROM paper_trades WHERE status='closed' ORDER BY exit_date DESC")
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
+
+
+def paper_trade_scorecard() -> dict:
+    """Compute running scorecard for paper trades."""
+    init_trades_tables()
+    closed = load_closed_paper_trades()
+    open_t = load_open_paper_trades()
+
+    if not closed:
+        return {"total": 0, "open": len(open_t), "closed": 0,
+                "win_rate": None, "mean_pnl": None, "total_pnl": None,
+                "profit_factor": None, "mean_pct": None}
+
+    wins      = [t for t in closed if (t.get("pnl") or 0) > 0]
+    losses    = [t for t in closed if (t.get("pnl") or 0) <= 0]
+    pnls      = [t.get("pnl") or 0 for t in closed]
+    pcts      = [t.get("pnl_pct") or 0 for t in closed]
+    win_rate  = len(wins) / len(closed) * 100
+    gross_win = sum(t["pnl"] for t in wins) if wins else 0
+    gross_loss= abs(sum(t["pnl"] for t in losses)) if losses else 0
+    pf        = round(gross_win / gross_loss, 2) if gross_loss > 0 else None
+
+    return {
+        "total":         len(closed) + len(open_t),
+        "open":          len(open_t),
+        "closed":        len(closed),
+        "wins":          len(wins),
+        "losses":        len(losses),
+        "win_rate":      round(win_rate, 1),
+        "mean_pnl":      round(sum(pnls) / len(pnls), 2),
+        "total_pnl":     round(sum(pnls), 2),
+        "profit_factor": pf,
+        "mean_pct":      round(sum(pcts) / len(pcts), 2),
     }
