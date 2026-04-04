@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np, pandas as pd
 import plotly.graph_objects as go
 import requests
+import dash
 from dash import Dash, Input, Output, State, dcc, html, ctx
 from dash.dependencies import ALL
 from dash.exceptions import PreventUpdate
@@ -16,9 +17,13 @@ from tsunami_validation import (init_validation_tables, log_signals, check_pendi
     load_pending, load_resolved, load_scorecard, HORIZONS)
 from tsunami_universe import (
     init_universe_table, run_universe_scan, load_universe_latest, get_universe_scan_date,
-    init_tsx_table, run_tsx_scan, load_tsx_latest, get_tsx_scan_date, TSX_SECTORS
+    init_tsx_table, run_tsx_scan, load_tsx_latest, get_tsx_scan_date, TSX_SECTORS,
+    init_nightly_table, run_nightly_scan, load_nightly_best, get_nightly_scan_date,
+    start_nightly_scheduler, TSX_FULL, NYSE_FULL, CRYPTO_FULL_TICKERS
 )
 from tsunami_trades import (init_trades_tables, get_portfolio_value, set_portfolio_value,
+    get_daily_target, set_daily_target, get_pnl_tally,
+    get_questrade_accounts, load_questrade_holdings, save_questrade_holdings,
     add_custom_ticker, load_custom_tickers, get_entry_signals, check_exit_signals,
     load_open_trades, load_closed_trades, log_trade, trade_summary,
     get_cadusd_rate, currency_symbol, is_cad, MIN_CONVICTION, MIN_STAGE,
@@ -177,19 +182,38 @@ def stage_bar(stage):
     return html.Div(dots,style={"display":"flex","alignItems":"center","width":"100%","marginTop":"10px"})
 
 def make_phase_chart(ticker,history_json,height=380,show_title=True):
+    def empty_fig(msg="No data"):
+        fig=go.Figure()
+        fig.add_annotation(text=msg,xref="paper",yref="paper",x=0.5,y=0.5,
+                          showarrow=False,font=dict(size=12,color="#424870"))
+        fig.update_layout(height=height,
+                         paper_bgcolor=BG_DEEP,
+                         plot_bgcolor=BG_DEEP,
+                         margin=dict(l=0,r=0,t=0,b=0))
+        return fig
     try:hist=pd.DataFrame(json.loads(history_json))
-    except:return go.Figure()
+    except:return empty_fig("Invalid history data")
+    if hist.empty:return empty_fig("No history data")
+    # Track whether we needed the slope fallback for chart annotation
+    slope_was_missing = False
     # Try full dropna first, fall back to partial if needed
     hist_full=hist.dropna(subset=["compression_ratio","cwt_cycle_slope","energy_ratio"])
     if len(hist_full)>=3:
         hist=hist_full
     else:
-        # Fall back — fill missing slope with 0
+        # Partial fallback — fill missing CWT columns so we can still draw the path
         hist=hist.copy()
-        hist["cwt_cycle_slope"]=hist["cwt_cycle_slope"].fillna(0)
-        hist["energy_ratio"]=hist["energy_ratio"].fillna(1)
+        if "cwt_cycle_slope" not in hist.columns or hist["cwt_cycle_slope"].isna().all():
+            hist["cwt_cycle_slope"]=0.0
+            slope_was_missing = True
+        else:
+            hist["cwt_cycle_slope"]=hist["cwt_cycle_slope"].fillna(0.0)
+        if "energy_ratio" not in hist.columns or hist["energy_ratio"].isna().all():
+            hist["energy_ratio"]=1.0
+        else:
+            hist["energy_ratio"]=hist["energy_ratio"].fillna(1.0)
         hist=hist.dropna(subset=["compression_ratio"])
-    if len(hist)<3:return go.Figure()
+    if len(hist)<3:return empty_fig(f"Only {len(hist)} valid rows")
     n=len(hist);fig=go.Figure()
 
     # ── Coloured regime zones ──
@@ -244,25 +268,61 @@ def make_phase_chart(ticker,history_json,height=380,show_title=True):
             xaxis=dict(title="Compression",color=TEXT_SEC,backgroundcolor=BG_PANEL,gridcolor=BORDER),
             yaxis=dict(title="CWT Slope",color=TEXT_SEC,backgroundcolor=BG_PANEL,gridcolor=BORDER),
             zaxis=dict(title="Energy",color=TEXT_SEC,backgroundcolor=BG_PANEL,gridcolor=BORDER)),
-        title=dict(text=f"{ticker} — Phase Space (coloured by regime)" if show_title else "",
+        title=dict(text=(f"{ticker} — Phase Space (CWT slope missing — rescan to populate)" if slope_was_missing
+                         else f"{ticker} — Phase Space (coloured by regime)") if show_title else "",
             font=dict(color=TEXT_SEC,size=12)),
         legend=dict(bgcolor=BG_PANEL,font=dict(color=TEXT_SEC,size=10),itemsizing="constant"))
     return fig
+
+def _load_anthropic_key() -> str:
+    """Try several locations for the Anthropic API key. Returns '' if not found."""
+    # 1. Environment variable (most portable)
+    import os
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key:
+        return key
+    # 2. ~/.claude_config.json  (original location)
+    for fname in (".claude_config.json", "claude_config.json"):
+        cfg_path = Path.home() / fname
+        try:
+            cfg = json.loads(cfg_path.read_text())
+            key = cfg.get("anthropic_api_key", "") or cfg.get("api_key", "")
+            if key:
+                return key
+        except Exception:
+            pass
+    # 3. ~/Downloads/claude_config.json  (common drop location on macOS)
+    try:
+        cfg = json.loads((Path.home() / "Downloads" / "claude_config.json").read_text())
+        key = cfg.get("anthropic_api_key", "") or cfg.get("api_key", "")
+        if key:
+            return key
+    except Exception:
+        pass
+    return ""
 
 def get_ai_commentary(r):
     ticker=r["ticker"];wl=get_full_watchlist();info=wl.get(ticker,{"label":ticker})
     state=r.get("state","neutral");stage=r.get("stage",0);score=conviction_score(r)
     prompt=f"You are Tsunami, a market regime detection system. Analyze {info['label']} ({ticker}) in 3-4 sentences. State {state} Stage {stage}, conviction {score}/100. Price: {fmt_price(r.get('price'),ticker)}. Compression: {r.get('compression','n/a')}, Energy: {r.get('energy','n/a')}, CWT slope: {r.get('cwt_slope','n/a')}, Conc: {r.get('cwt_conc','n/a')}, Exc reversal: {'YES' if r.get('exc_reversal') else 'NO'}. End with what to watch for next. No bullets."
+    key = _load_anthropic_key()
+    if not key:
+        return (f"{info['label']} ({ticker}) is in {STATE_LABEL.get(state, state)} at Stage {stage} "
+                f"with conviction {score}/100. "
+                f"Compression: {fmt_val(r.get('compression'))}, Energy: {fmt_val(r.get('energy'))}, "
+                f"Slope: {fmt_val(r.get('cwt_slope'),2)}. "
+                f"To enable AI commentary, set ANTHROPIC_API_KEY in your environment "
+                f"or save your key to ~/claude_config.json as {{\"anthropic_api_key\": \"sk-ant-...\"}}.")
     try:
-        cfg=json.loads((Path.home()/".claude_config.json").read_text())
-        key=cfg.get("anthropic_api_key","")
         resp=requests.post("https://api.anthropic.com/v1/messages",
             headers={"Content-Type":"application/json","x-api-key":key,"anthropic-version":"2023-06-01"},
             json={"model":"claude-haiku-4-5-20251001","max_tokens":300,"messages":[{"role":"user","content":prompt}]},timeout=30)
         data=resp.json()
         if "content" in data and data["content"]:return data["content"][0].get("text","").strip()
-        return "Analysis unavailable."
-    except Exception as e:return f"Analysis unavailable: {str(e)[:60]}"
+        error=data.get("error",{}).get("message","unknown error")
+        return f"AI analysis unavailable — API error: {error[:80]}"
+    except Exception as e:
+        return f"AI analysis unavailable — {type(e).__name__}: {str(e)[:80]}"
 
 def save_commentary(ticker,scan_date,text):
     con=sqlite3.connect(DB_PATH);cur=con.cursor()
@@ -443,18 +503,66 @@ def detail_panel(r):
         ]),
     ],style={"background":BG_CARD,"border":f"2px solid {color}","borderRadius":"12px","padding":"24px","marginBottom":"20px"})
 
+def _make_sparkline(history_json: str, width: int = 300, height: int = 90) -> str:
+    """
+    Build a lightweight SVG sparkline showing Energy and Compression over time.
+    No WebGL — pure SVG, zero browser GPU cost. One per intelligence card is fine.
+    """
+    try:
+        import json as _json
+        hist = pd.DataFrame(_json.loads(history_json))
+        if hist.empty: raise ValueError("empty")
+        energy = hist["energy_ratio"].dropna().tolist()[-40:]
+        comp   = hist["compression_ratio"].dropna().tolist()[-40:]
+        if len(energy) < 3: raise ValueError("too short")
+    except Exception:
+        return f'''<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">
+            <rect width="100%" height="100%" fill="{BG_DEEP}" rx="6"/>
+            <text x="50%" y="50%" fill="#424870" font-size="11" text-anchor="middle" dominant-baseline="middle">No history</text>
+        </svg>'''
+
+    def _points(vals, w, h, lo, hi):
+        rng = hi - lo or 1
+        n   = len(vals)
+        pts = []
+        for i, v in enumerate(vals):
+            x = int(i / (n - 1) * (w - 16)) + 8
+            y = int(h - 8 - (v - lo) / rng * (h - 16))
+            pts.append(f"{x},{y}")
+        return " ".join(pts)
+
+    e_lo, e_hi = min(energy), max(energy)
+    c_lo, c_hi = min(comp),   max(comp)
+    e_pts = _points(energy, width, height, e_lo, e_hi)
+    c_pts = _points(comp,   width, height, c_lo, c_hi)
+
+    # Colour last point by level
+    last_e = energy[-1]
+    e_col  = "#ef5350" if last_e > 1.55 else "#66bb6a" if last_e > 1.15 else "#f57c00"
+
+    return f'''<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">
+        <rect width="100%" height="100%" fill="{BG_DEEP}" rx="6"/>
+        <polyline points="{c_pts}" fill="none" stroke="#37474f" stroke-width="1.5" stroke-dasharray="3,2" opacity="0.6"/>
+        <polyline points="{e_pts}" fill="none" stroke="{e_col}" stroke-width="2"/>
+        <circle cx="{e_pts.split()[-1].split(",")[0]}" cy="{e_pts.split()[-1].split(",")[1]}"
+                r="4" fill="{e_col}" stroke="{BG_DEEP}" stroke-width="1.5"/>
+        <text x="8" y="12" fill="#424870" font-size="9" font-family="monospace">Energy</text>
+        <text x="{width-8}" y="12" fill="#424870" font-size="9" font-family="monospace"
+              text-anchor="end">{last_e:.2f}</text>
+    </svg>'''
+
 def intelligence_card(r,commentary):
     ticker=r["ticker"];wl=get_full_watchlist();info=wl.get(ticker,{"label":ticker})
     state=r.get("state","neutral");stage=r.get("stage",0);color=STATE_COLOR.get(state,BORDER)
     emoji=STATE_EMOJI.get(state,"");score=conviction_score(r);pct5_str,pct5c=fmt_pct(r.get("pct_5d"))
-    phase_fig=make_phase_chart(ticker,r.get("history_json","[]"),height=280,show_title=False)
+    sparkline_svg = _make_sparkline(r.get("history_json","[]"))
     return html.Div([
         html.Div([
             html.Div([html.Span(f"{emoji} ",style={"fontSize":"18px"}),
                 html.Span(info["label"],style={"fontWeight":"700","color":TEXT_PRI,"fontSize":"17px"}),
                 html.Span(f" {ticker}",style={"color":TEXT_DIM,"fontSize":"12px","marginLeft":"4px"})]),
             html.Div([html.Span(f"Stage {stage}",style={"color":color,"fontWeight":"700","fontSize":"13px","marginRight":"10px"}),
-                html.Span(STATE_LABEL.get(state, state.replace('_',' ').title()),style={"background":color,"color":"white","fontSize":"9px","padding":"3px 8px","borderRadius":"8px","fontWeight":"700"}),
+                html.Span(STATE_LABEL.get(state, state.replace('_'," ").title()),style={"background":color,"color":"white","fontSize":"9px","padding":"3px 8px","borderRadius":"8px","fontWeight":"700"}),
                 html.Span(f"  {pct5_str}",style={"color":pct5c,"fontSize":"13px","fontWeight":"600","marginLeft":"10px"})]),
         ],style={"display":"flex","justifyContent":"space-between","alignItems":"center","marginBottom":"16px"}),
         html.Div([
@@ -469,17 +577,765 @@ def intelligence_card(r,commentary):
                     ("Exc Rev","✅" if r.get("exc_reversal") else "—")]]],
                 style={"marginTop":"14px","paddingTop":"12px","borderTop":f"1px solid {BORDER}"}),
             ],style={"flex":"1","marginRight":"24px","minWidth":"0"}),
-            html.Div([dcc.Graph(figure=phase_fig,config={"displayModeBar":False},style={"width":"320px"})],style={"flexShrink":"0"}),
+            # Lightweight SVG sparkline — no WebGL, no context limit
+            html.Div([
+                html.Div("Energy vs Compression — 40 days",
+                    style={"fontSize":"9px","color":TEXT_DIM,"textTransform":"uppercase",
+                           "letterSpacing":"0.5px","marginBottom":"6px"}),
+                html.Img(src=f"data:image/svg+xml;utf8,{sparkline_svg}",
+                    style={"width":"300px","height":"90px","borderRadius":"6px","display":"block"}),
+                html.Div([
+                    html.Span("━ Energy  ", style={"color":"#f57c00","fontSize":"10px","fontFamily":"monospace"}),
+                    html.Span("╌ Compression", style={"color":"#37474f","fontSize":"10px","fontFamily":"monospace"}),
+                ],style={"marginTop":"6px"}),
+                html.Div("Full 3D phase chart available in Grid → click asset",
+                    style={"fontSize":"9px","color":TEXT_DIM,"marginTop":"8px","fontStyle":"italic"}),
+            ],style={"flexShrink":"0","width":"320px","background":BG_DEEP,"borderRadius":"8px","padding":"12px"}),
         ],style={"display":"flex","alignItems":"flex-start"}),
     ],style={"background":BG_CARD,"border":f"1px solid {color}60","borderLeft":f"5px solid {color}","borderRadius":"12px","padding":"20px","marginBottom":"16px"})
 
-def build_intelligence_tab(rows):
-    active=sorted([r for r in rows if r.get("stage",0)>=2],key=lambda r:conviction_score(r),reverse=True)
-    if not active:
-        return html.Div("All quiet.",style={"color":TEXT_DIM,"textAlign":"center","padding":"60px","fontSize":"16px"})
+# ---------------------------------------------------------------------------
+# Scotia Portfolio helpers
+# ---------------------------------------------------------------------------
+
+def _parse_scotia_csv(filepath: str) -> list[dict]:
+    """Parse Scotia iTrade account_details CSV into clean holdings list."""
+    import csv, os
+    if not os.path.exists(filepath):
+        return []
+    rows = []
+    with open(filepath, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                symbol      = row.get("Symbol","").strip()
+                name        = row.get("Security name","").strip()
+                asset_class = row.get("Asset class","").strip()
+                industry    = row.get("Industry category","").strip()
+                currency    = row.get("Currency","CAD").strip()
+                qty         = float(row.get("Quantity","0") or 0)
+                avg_cost    = float(row.get("Average cost ($)","0") or 0)
+                mkt_price   = float(row.get("Market price ($)","0") or 0)
+                book_val    = float(row.get("Book value ($)","0") or 0)
+                mkt_val     = float(row.get("Market value ($)","0") or 0)
+                chg_pct     = float(row.get("Change (%)","0") or 0)
+                chg_dol     = float(row.get("Change ($)","0") or 0)
+                ann_income  = float(row.get("Projected Annual income ($)","0") or 0)
+                ann_yield   = float(row.get("Projected Annual yield (%)","0") or 0)
+                rows.append({
+                    "symbol": symbol, "name": name, "asset_class": asset_class,
+                    "industry": industry, "currency": currency, "qty": qty,
+                    "avg_cost": avg_cost, "mkt_price": mkt_price, "book_val": book_val,
+                    "mkt_val": mkt_val, "chg_pct": chg_pct, "chg_dol": chg_dol,
+                    "ann_income": ann_income, "ann_yield": ann_yield,
+                })
+            except Exception:
+                continue
+    return rows
+
+def _get_latest_portfolio_csv() -> str:
+    """Find the most recent account_details CSV in ~/Downloads."""
+    import glob, os
+    pattern = str(Path.home() / "Downloads" / "account_details_*.csv")
+    files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    return files[0] if files else ""
+
+def _match_scan_row(symbol: str, scan_rows: list[dict]) -> dict | None:
+    """Match a Scotia symbol to a Tsunami scan row. Handles .TO suffix."""
+    if not symbol or symbol == "N/A":
+        return None
+    # Try direct match first
+    for r in scan_rows:
+        if r["ticker"].upper() == symbol.upper():
+            return r
+    # Try with .TO suffix (Scotia lists TSX stocks without it sometimes)
+    for r in scan_rows:
+        if r["ticker"].upper() == symbol.upper() + ".TO":
+            return r
+    # Try without .TO
+    for r in scan_rows:
+        if r["ticker"].upper().replace(".TO","") == symbol.upper().replace(".TO",""):
+            return r
+    return None
+
+def build_portfolio_tab(scan_rows: list[dict]) -> html.Div:
+    """Scotia portfolio tab — holdings with Tsunami regime overlay."""
+    from pathlib import Path as _Path
+
+    csv_path = _get_latest_portfolio_csv()
+    holdings = _parse_scotia_csv(csv_path) if csv_path else []
+
+    # ── Summary numbers ──
+    total_mkt    = sum(h["mkt_val"] for h in holdings)
+    total_book   = sum(h["book_val"] for h in holdings)
+    total_gain   = total_mkt - total_book
+    total_gain_p = (total_gain / total_book * 100) if total_book else 0
+    total_income = sum(h["ann_income"] for h in holdings)
+    total_yield  = (total_income / total_mkt * 100) if total_mkt else 0
+
+    # Group by asset class
+    by_class = {}
+    for h in holdings:
+        ac = h["asset_class"] or "Other"
+        by_class.setdefault(ac, []).append(h)
+
+    class_order = ["Equities", "Fixed Income", "Real Estate", "Cash & Short Term", "Other"]
+
+    def gc(v): return "#00e676" if v >= 0 else "#ff1744"
+    def fmt_cad(v): return f"CA${v:,.0f}"
+    def fmt_pct(v): return f"{'+'if v>=0 else ''}{v:.2f}%"
+
+    # ── Upload / refresh section ──
+    import os
+    csv_name = os.path.basename(csv_path) if csv_path else "None found"
+    last_updated = ""
+    if csv_path:
+        import datetime
+        mtime = os.path.getmtime(csv_path)
+        last_updated = datetime.datetime.fromtimestamp(mtime).strftime("%b %d, %Y %I:%M %p")
+
+    header_section = html.Div([
+        html.Div([
+            html.Div([
+                html.Div("🏦 Scotia Portfolio", style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI}),
+                html.Div(f"File: {csv_name}  ·  Updated: {last_updated or 'never'}",
+                    style={"color":TEXT_DIM,"fontSize":"11px","marginTop":"3px"}),
+            ]),
+            html.Div([
+                html.Div("To refresh: export Holdings CSV from Scotia iTrade → save to Downloads",
+                    style={"color":TEXT_DIM,"fontSize":"11px","fontStyle":"italic"}),
+            ]),
+        ], style={"display":"flex","justifyContent":"space-between","alignItems":"flex-start",
+                  "marginBottom":"20px","paddingBottom":"16px","borderBottom":f"1px solid {BORDER}"}),
+    ])
+
+    if not holdings:
+        return html.Div([
+            header_section,
+            html.Div([
+                html.Div("📂 No portfolio file found", style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"8px"}),
+                html.Div("Export your holdings from Scotia iTrade and save to your Downloads folder.",
+                    style={"color":TEXT_DIM,"fontSize":"13px","marginBottom":"16px"}),
+                html.Div("In Scotia iTrade: Accounts → Holdings → Export → CSV",
+                    style={"color":TEXT_SEC,"fontSize":"12px","fontStyle":"italic"}),
+            ], style={"textAlign":"center","padding":"60px"}),
+        ])
+
+    # ── Portfolio summary cards ──
+    summary = html.Div([
+        *[html.Div([
+            html.Div(label, style={"fontSize":"10px","color":TEXT_DIM,"textTransform":"uppercase","letterSpacing":"0.5px","marginBottom":"6px"}),
+            html.Div(value, style={"fontSize":"20px","fontWeight":"800","color":color}),
+        ], style={"background":BG_DEEP,"borderRadius":"10px","padding":"14px 18px","textAlign":"center","flex":"1"})
+        for label, value, color in [
+            ("Total Market Value",  fmt_cad(total_mkt),    TEXT_PRI),
+            ("Total Book Value",    fmt_cad(total_book),   TEXT_PRI),
+            ("Total Gain / Loss",   f"{fmt_cad(total_gain)} ({fmt_pct(total_gain_p)})", gc(total_gain)),
+            ("Annual Income",       fmt_cad(total_income), "#66bb6a"),
+            ("Portfolio Yield",     f"{total_yield:.2f}%", "#66bb6a"),
+        ]],
+    ], style={"display":"flex","gap":"10px","marginBottom":"24px","flexWrap":"wrap"})
+
+    # ── Asset class breakdown ──
+    class_cards = []
+    for ac in class_order:
+        items = by_class.get(ac, [])
+        if not items: continue
+        ac_val  = sum(h["mkt_val"] for h in items)
+        ac_gain = sum(h["chg_dol"] for h in items)
+        ac_pct  = ac_val / total_mkt * 100 if total_mkt else 0
+        class_cards.append(html.Div([
+            html.Div(ac, style={"fontSize":"10px","color":TEXT_DIM,"fontWeight":"700","textTransform":"uppercase","marginBottom":"4px"}),
+            html.Div(fmt_cad(ac_val), style={"fontSize":"16px","fontWeight":"800","color":TEXT_PRI}),
+            html.Div(f"{ac_pct:.1f}% of portfolio", style={"fontSize":"10px","color":TEXT_DIM,"marginTop":"2px"}),
+            html.Div(fmt_pct(ac_gain/sum(h["book_val"] for h in items)*100) if sum(h["book_val"] for h in items) else "—",
+                style={"fontSize":"12px","color":gc(ac_gain),"fontWeight":"600","marginTop":"4px"}),
+        ], style={"background":BG_DEEP,"borderRadius":"8px","padding":"12px 14px","textAlign":"center","flex":"1","minWidth":"120px"}))
+
+    class_row = html.Div(class_cards, style={"display":"flex","gap":"10px","marginBottom":"24px","flexWrap":"wrap"})
+
+    # ── Holdings sections by asset class ──
+    th_s = {"padding":"8px 10px","color":TEXT_DIM,"fontSize":"10px","textTransform":"uppercase",
+            "fontWeight":"700","borderBottom":f"1px solid {BORDER}","textAlign":"left",
+            "background":BG_DEEP,"position":"sticky","top":"0"}
+
+    sections = []
+    for ac in class_order:
+        items = by_class.get(ac, [])
+        if not items: continue
+
+        # Sort equities by market value desc
+        items = sorted(items, key=lambda h: h["mkt_val"], reverse=True)
+
+        rows_html = []
+        for h in items:
+            symbol     = h["symbol"]
+            scan_row   = _match_scan_row(symbol, scan_rows)
+            gain_c     = gc(h["chg_dol"])
+            unrealised = h["mkt_val"] - h["book_val"]
+            unrealised_pct = (unrealised / h["book_val"] * 100) if h["book_val"] else 0
+
+            # Tsunami regime badge
+            if scan_row:
+                state  = scan_row.get("state","neutral")
+                stage  = scan_row.get("stage",0)
+                score  = conviction_score(scan_row)
+                color  = STATE_COLOR.get(state,"#455a64")
+                emoji  = STATE_EMOJI.get(state,"")
+                label  = STATE_LABEL.get(state, state.replace("_"," ").title())
+                regime_badge = html.Td([
+                    html.Span(f"{emoji} {label}",
+                        style={"background":color,"color":"white","fontSize":"9px",
+                               "padding":"2px 7px","borderRadius":"6px","fontWeight":"700",
+                               "marginRight":"4px"}),
+                    html.Span(f"S{stage}",
+                        style={"color":color,"fontSize":"10px","fontWeight":"700","marginRight":"4px"}),
+                    html.Span(str(score),
+                        style={"color":score_color(score),"fontSize":"11px","fontWeight":"900"}),
+                ], style={"padding":"8px 10px","whiteSpace":"nowrap"})
+            elif symbol == "N/A":
+                regime_badge = html.Td("—", style={"padding":"8px 10px","color":TEXT_DIM,"fontSize":"11px"})
+            else:
+                regime_badge = html.Td("Not scanned",
+                    style={"padding":"8px 10px","color":TEXT_DIM,"fontSize":"10px","fontStyle":"italic"})
+
+            rows_html.append(html.Tr([
+                html.Td([
+                    html.Div(h["name"][:45], style={"fontWeight":"700","color":TEXT_PRI,"fontSize":"12px"}),
+                    html.Div(symbol if symbol != "N/A" else h["industry"],
+                        style={"color":TEXT_DIM,"fontSize":"10px","marginTop":"2px"}),
+                ], style={"padding":"8px 10px","minWidth":"200px"}),
+                html.Td(f"{h['qty']:,.2f}", style={"padding":"8px 10px","color":TEXT_DIM,"fontSize":"11px","textAlign":"right"}),
+                html.Td(f"CA${h['avg_cost']:,.2f}", style={"padding":"8px 10px","color":TEXT_DIM,"fontSize":"11px","textAlign":"right"}),
+                html.Td(f"CA${h['mkt_price']:,.2f}", style={"padding":"8px 10px","color":TEXT_PRI,"fontSize":"11px","fontWeight":"600","textAlign":"right"}),
+                html.Td(fmt_cad(h["mkt_val"]), style={"padding":"8px 10px","color":TEXT_PRI,"fontSize":"12px","fontWeight":"700","textAlign":"right"}),
+                html.Td([
+                    html.Div(f"{fmt_pct(unrealised_pct)}", style={"color":gain_c,"fontWeight":"700","fontSize":"12px"}),
+                    html.Div(f"{fmt_cad(unrealised)}", style={"color":gain_c,"fontSize":"10px"}),
+                ], style={"padding":"8px 10px","textAlign":"right"}),
+                html.Td([
+                    html.Div(f"{h['ann_yield']:.2f}%", style={"color":"#66bb6a","fontWeight":"600","fontSize":"11px"}),
+                    html.Div(f"{fmt_cad(h['ann_income'])}/yr", style={"color":TEXT_DIM,"fontSize":"10px"}),
+                ], style={"padding":"8px 10px","textAlign":"right"}),
+                regime_badge,
+            ], style={"borderBottom":f"1px solid {BORDER}","background":BG_CARD}))
+
+        ac_total = sum(h["mkt_val"] for h in items)
+        ac_unrealised = sum(h["mkt_val"] - h["book_val"] for h in items)
+        ac_unrealised_pct = ac_unrealised / sum(h["book_val"] for h in items) * 100 if sum(h["book_val"] for h in items) else 0
+
+        sections.append(html.Div([
+            html.Div([
+                html.Span(ac, style={"fontSize":"14px","fontWeight":"700","color":TEXT_PRI}),
+                html.Span(f"  {fmt_cad(ac_total)}",
+                    style={"fontSize":"13px","color":TEXT_SEC,"marginLeft":"10px"}),
+                html.Span(f"  {fmt_pct(ac_unrealised_pct)}",
+                    style={"fontSize":"12px","color":gc(ac_unrealised),"marginLeft":"8px","fontWeight":"600"}),
+            ], style={"marginBottom":"10px"}),
+            html.Div([
+                html.Table([
+                    html.Thead(html.Tr([
+                        html.Th(c, style=th_s) for c in
+                        ["Security","Qty","Avg Cost","Price","Market Value","Gain / Loss","Yield","Tsunami Signal"]
+                    ])),
+                    html.Tbody(rows_html),
+                ], style={"width":"100%","borderCollapse":"collapse","minWidth":"900px"}),
+            ], style={"overflowX":"auto"}),
+        ], style={"background":BG_CARD,"borderRadius":"10px","padding":"16px 20px","marginBottom":"16px"}))
+
+    # ── Tsunami alerts on your holdings ──
+    held_symbols = {h["symbol"].upper() for h in holdings if h["symbol"] != "N/A"}
+    held_to      = {s + ".TO" for s in held_symbols} | {s.replace(".TO","") for s in held_symbols}
+    all_held     = held_symbols | held_to
+
+    portfolio_signals = [r for r in scan_rows
+                         if r.get("ticker","").upper() in all_held and r.get("stage",0) >= 3]
+    portfolio_signals = sorted(portfolio_signals, key=lambda r: conviction_score(r), reverse=True)
+
+    signal_cards = []
+    for r in portfolio_signals:
+        ticker  = r["ticker"]
+        state   = r.get("state","neutral")
+        stage   = r.get("stage",0)
+        score   = conviction_score(r)
+        color   = STATE_COLOR.get(state,"#455a64")
+        emoji   = STATE_EMOJI.get(state,"")
+        label   = STATE_LABEL.get(state, state.replace("_"," ").title())
+        holding = next((h for h in holdings
+                        if h["symbol"].upper() in (ticker.upper(), ticker.upper().replace(".TO",""))), None)
+        mkt_val = holding["mkt_val"] if holding else 0
+        unrealised = (holding["mkt_val"] - holding["book_val"]) if holding else 0
+
+        signal_cards.append(html.Div([
+            html.Div([
+                html.Span(f"{emoji} ", style={"fontSize":"16px"}),
+                html.Span(ticker, style={"fontWeight":"900","color":TEXT_PRI,"fontSize":"15px","marginRight":"8px"}),
+                html.Span(STATE_LABEL.get(state,label),
+                    style={"background":color,"color":"white","fontSize":"9px",
+                           "padding":"3px 8px","borderRadius":"6px","fontWeight":"700","marginRight":"8px"}),
+                html.Span(f"Stage {stage}", style={"color":color,"fontWeight":"700","fontSize":"12px"}),
+            ], style={"marginBottom":"8px"}),
+            html.Div([
+                html.Div([
+                    html.Div("Conviction", style={"fontSize":"9px","color":TEXT_DIM,"marginBottom":"2px"}),
+                    html.Div(str(score), style={"fontSize":"20px","fontWeight":"900","color":score_color(score)}),
+                ], style={"background":BG_DEEP,"borderRadius":"6px","padding":"8px 12px","textAlign":"center","flex":"1"}),
+                html.Div([
+                    html.Div("You Hold", style={"fontSize":"9px","color":TEXT_DIM,"marginBottom":"2px"}),
+                    html.Div(fmt_cad(mkt_val), style={"fontSize":"14px","fontWeight":"700","color":TEXT_PRI}),
+                ], style={"background":BG_DEEP,"borderRadius":"6px","padding":"8px 12px","textAlign":"center","flex":"1"}),
+                html.Div([
+                    html.Div("Unrealised", style={"fontSize":"9px","color":TEXT_DIM,"marginBottom":"2px"}),
+                    html.Div(fmt_cad(unrealised), style={"fontSize":"14px","fontWeight":"700","color":gc(unrealised)}),
+                ], style={"background":BG_DEEP,"borderRadius":"6px","padding":"8px 12px","textAlign":"center","flex":"1"}),
+                html.Div([
+                    html.Div("Signal", style={"fontSize":"9px","color":TEXT_DIM,"marginBottom":"2px"}),
+                    html.Div(plain_english(r), style={"fontSize":"10px","color":TEXT_SEC,"lineHeight":"1.4"}),
+                ], style={"background":BG_DEEP,"borderRadius":"6px","padding":"8px 12px","flex":"3"}),
+            ], style={"display":"flex","gap":"8px"}),
+        ], style={"background":BG_CARD,"border":f"1px solid {color}50","borderLeft":f"4px solid {color}",
+                  "borderRadius":"8px","padding":"14px","marginBottom":"10px"}))
+
+    signals_section = html.Div([
+        html.Div(f"⚡ Tsunami Signals on Your Holdings ({len(portfolio_signals)})",
+            style={"fontSize":"14px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"12px"}),
+        *(signal_cards if signal_cards else [
+            html.Div("No Stage 3+ signals on your current holdings — all quiet.",
+                style={"color":TEXT_DIM,"fontSize":"13px","fontStyle":"italic","padding":"16px 0"})
+        ]),
+    ], style={"background":BG_CARD,"borderRadius":"10px","padding":"20px","marginBottom":"20px"})
+
+    # ── Questrade Accounts ──
+    questrade_sections = []
+    for acct_id, acct in get_questrade_accounts().items():
+        holdings_qt = load_questrade_holdings(acct_id)
+        live_prices = get_live_price_snapshot()
+        cadusd      = get_cadusd_rate()
+
+        qt_rows = []
+        total_qt_val  = 0.0
+        total_qt_cost = 0.0
+        for h in holdings_qt:
+            sym      = h["symbol"]
+            qty      = h.get("qty") or 0
+            avg_p    = h.get("avg_price") or 0
+            curr     = h.get("currency","CAD")
+            name     = h.get("name", sym)
+            # Get live price from cache or fall back to avg
+            live_p   = live_prices.get(sym) or live_prices.get(sym.replace(".TO","")) or avg_p
+            cost_val = qty * avg_p
+            mkt_val  = qty * live_p
+            gain     = mkt_val - cost_val
+            gain_pct = (gain / cost_val * 100) if cost_val else 0
+            total_qt_val  += mkt_val
+            total_qt_cost += cost_val
+
+            scan_row = _match_scan_row(sym, scan_rows)
+            if scan_row:
+                state  = scan_row.get("state","neutral")
+                stage  = scan_row.get("stage",0)
+                score  = conviction_score(scan_row)
+                color  = STATE_COLOR.get(state,"#455a64")
+                emoji  = STATE_EMOJI.get(state,"")
+                regime_cell = html.Td([
+                    html.Span(f"{emoji} {STATE_LABEL.get(state,state)}",
+                        style={"background":color,"color":"white","fontSize":"9px",
+                               "padding":"2px 7px","borderRadius":"6px","fontWeight":"700","marginRight":"4px"}),
+                    html.Span(f"S{stage} · {score}",
+                        style={"color":score_color(score),"fontSize":"11px","fontWeight":"900"}),
+                ], style={"padding":"8px 10px","whiteSpace":"nowrap"})
+            else:
+                regime_cell = html.Td("Scanning...",
+                    style={"padding":"8px 10px","color":TEXT_DIM,"fontSize":"10px","fontStyle":"italic"})
+
+            gc_fn = lambda v: "#00e676" if v >= 0 else "#ff1744"
+            qt_rows.append(html.Tr([
+                html.Td([
+                    html.Div(name, style={"fontWeight":"700","color":TEXT_PRI,"fontSize":"12px"}),
+                    html.Div(f"{sym} · {curr}", style={"color":TEXT_DIM,"fontSize":"10px","marginTop":"2px"}),
+                ], style={"padding":"8px 10px"}),
+                html.Td(f"{qty:,.0f}", style={"padding":"8px 10px","color":TEXT_DIM,"fontSize":"11px","textAlign":"right"}),
+                html.Td(f"${avg_p:,.4f}" if avg_p < 10 else f"${avg_p:,.2f}",
+                    style={"padding":"8px 10px","color":TEXT_DIM,"fontSize":"11px","textAlign":"right"}),
+                html.Td(f"${live_p:,.4f}" if live_p < 10 else f"${live_p:,.2f}",
+                    style={"padding":"8px 10px","color":TEXT_PRI,"fontWeight":"600","fontSize":"11px","textAlign":"right"}),
+                html.Td(f"${mkt_val:,.2f}",
+                    style={"padding":"8px 10px","color":TEXT_PRI,"fontWeight":"700","fontSize":"12px","textAlign":"right"}),
+                html.Td([
+                    html.Div(f"{'+'if gain_pct>=0 else ''}{gain_pct:.1f}%",
+                        style={"color":gc_fn(gain),"fontWeight":"700","fontSize":"12px"}),
+                    html.Div(f"{'+'if gain>=0 else ''}${gain:,.2f}",
+                        style={"color":gc_fn(gain),"fontSize":"10px"}),
+                ], style={"padding":"8px 10px","textAlign":"right"}),
+                regime_cell,
+            ], style={"borderBottom":f"1px solid {BORDER}","background":BG_CARD}))
+
+        total_gain_qt     = total_qt_val - total_qt_cost
+        total_gain_pct_qt = (total_gain_qt / total_qt_cost * 100) if total_qt_cost else 0
+        gc_fn = lambda v: "#00e676" if v >= 0 else "#ff1744"
+
+        th_s2 = {"padding":"8px 10px","color":TEXT_DIM,"fontSize":"10px","textTransform":"uppercase",
+                 "fontWeight":"700","borderBottom":f"1px solid {BORDER}","textAlign":"left","background":BG_DEEP}
+
+        questrade_sections.append(html.Div([
+            html.Div([
+                html.Div([
+                    html.Span("💳 ", style={"fontSize":"16px"}),
+                    html.Span(acct["label"], style={"fontWeight":"700","color":TEXT_PRI,"fontSize":"15px"}),
+                    html.Span(f"  {acct['type']} · #{acct['account']}",
+                        style={"color":TEXT_DIM,"fontSize":"11px","marginLeft":"8px"}),
+                ]),
+                html.Div([
+                    html.Span(f"${total_qt_val:,.2f}",
+                        style={"fontSize":"18px","fontWeight":"800","color":TEXT_PRI,"marginRight":"12px"}),
+                    html.Span(f"{'+'if total_gain_qt>=0 else ''}${total_gain_qt:,.2f}",
+                        style={"fontSize":"14px","fontWeight":"700","color":gc_fn(total_gain_qt),"marginRight":"6px"}),
+                    html.Span(f"({total_gain_pct_qt:+.1f}%)",
+                        style={"fontSize":"13px","color":gc_fn(total_gain_qt),"fontWeight":"600"}),
+                ]),
+            ], style={"display":"flex","justifyContent":"space-between","alignItems":"center","marginBottom":"14px"}),
+            html.Div([
+                html.Table([
+                    html.Thead(html.Tr([html.Th(c, style=th_s2) for c in
+                        ["Security","Qty","Avg Price","Live Price","Market Value","Gain / Loss","Tsunami Signal"]])),
+                    html.Tbody(qt_rows),
+                ], style={"width":"100%","borderCollapse":"collapse","minWidth":"700px"}),
+            ], style={"overflowX":"auto"}),
+        ], style={"background":BG_CARD,"borderRadius":"10px","padding":"20px","marginBottom":"16px",
+                  "border":f"1px solid #5c6bc040","borderLeft":"4px solid #5c6bc0"}))
+
     return html.Div([
-        html.Div([html.Div("🧠 Tsunami Intelligence",style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI}),
-            html.Div(f"{len(active)} assets · sorted by conviction",style={"color":TEXT_DIM,"fontSize":"12px","marginTop":"3px"})],
+        header_section,
+        summary,
+        class_row,
+        # Questrade accounts
+        html.Div([
+            html.Div("💳 Questrade Accounts",
+                style={"fontSize":"14px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"12px"}),
+            *questrade_sections,
+        ], style={"marginBottom":"8px"}) if questrade_sections else html.Div(),
+        signals_section,
+        *sections,
+    ])
+
+
+# Company name lookup for nightly scan results
+NAME_MAP = {
+    "RY.TO":"Royal Bank","TD.TO":"TD Bank","BNS.TO":"Scotiabank","BMO.TO":"Bank of Montreal",
+    "CM.TO":"CIBC","NA.TO":"National Bank","MFC.TO":"Manulife","SLF.TO":"Sun Life",
+    "IFC.TO":"Intact Financial","GWO.TO":"Great-West Lifeco","CNQ.TO":"Canadian Natural",
+    "SU.TO":"Suncor","CVE.TO":"Cenovus","IMO.TO":"Imperial Oil","TOU.TO":"Tourmaline",
+    "ARX.TO":"Arc Resources","ENB.TO":"Enbridge","TRP.TO":"TC Energy","PPL.TO":"Pembina",
+    "ABX.TO":"Barrick Gold","AEM.TO":"Agnico Eagle","WPM.TO":"Wheaton Precious",
+    "FM.TO":"First Quantum","TECK-B.TO":"Teck Resources","NTR.TO":"Nutrien",
+    "SHOP.TO":"Shopify","CSU.TO":"Constellation SW","BB.TO":"BlackBerry",
+    "OTEX.TO":"Open Text","KXS.TO":"Kinaxis","FTS.TO":"Fortis","H.TO":"Hydro One",
+    "CNR.TO":"CN Rail","CP.TO":"CP Kansas City","WCN.TO":"Waste Connections",
+    "L.TO":"Loblaw","MRU.TO":"Metro","ATD.TO":"Couche-Tard","DOL.TO":"Dollarama",
+    "BCE.TO":"BCE Inc","RCI-B.TO":"Rogers","T.TO":"Telus","REI-UN.TO":"RioCan REIT",
+    "BN.TO":"Brookfield Corp","BAM.TO":"Brookfield AM","POW.TO":"Power Corp",
+    "TVE.TO":"Tamarack Valley","MEG.TO":"MEG Energy","BEP-UN.TO":"Brookfield Renewable",
+    "BIP-UN.TO":"Brookfield Infra","TIH.TO":"Toromont","WSP.TO":"WSP Global",
+    "KEY.TO":"Keyera","GEI.TO":"Gibson Energy","ERF.TO":"Enerplus","PEY.TO":"Peyto",
+    "K.TO":"Kinross Gold","AGI.TO":"Alamos Gold","OR.TO":"Osisko Royalties",
+    "IVN.TO":"Ivanhoe Mines","MG.TO":"Magna Intl","CCL-B.TO":"CCL Industries",
+    "LSPD.TO":"Lightspeed","STN.TO":"Stantec","ATRL.TO":"AtkinsRealis","TFI.TO":"TFI Intl",
+    "EMP-A.TO":"Empire Co","MTY.TO":"MTY Food","QSR.TO":"Restaurant Brands",
+    "CRT-UN.TO":"CT REIT","AP-UN.TO":"Allied REIT","HR-UN.TO":"H&R REIT",
+    "SRU-UN.TO":"SmartCentres","DIR-UN.TO":"Dream Industrial","QBR-B.TO":"Quebecor",
+    "MBT.TO":"Manitoba Telecom","CWB.TO":"CWB Financial","X.TO":"TMX Group",
+    "FFH.TO":"Fairfax Financial","AQN.TO":"Algonquin Power","EMA.TO":"Emera",
+    "INE.TO":"Innergex","NVEI.TO":"Nuvei","DND.TO":"Dye & Durham","BB.TO":"BlackBerry",
+    "AAPL":"Apple","MSFT":"Microsoft","GOOGL":"Alphabet","AMZN":"Amazon",
+    "NVDA":"Nvidia","META":"Meta","TSLA":"Tesla","NFLX":"Netflix","AMD":"AMD",
+    "INTC":"Intel","TSM":"TSMC","AVGO":"Broadcom","QCOM":"Qualcomm","MU":"Micron",
+    "AMAT":"Applied Materials","LRCX":"Lam Research","KLAC":"KLA Corp","ARM":"Arm Holdings",
+    "SMCI":"SuperMicro","JPM":"JPMorgan","BAC":"Bank of America","GS":"Goldman Sachs",
+    "MS":"Morgan Stanley","WFC":"Wells Fargo","C":"Citigroup","BLK":"BlackRock",
+    "SCHW":"Charles Schwab","AXP":"Amex","V":"Visa","MA":"Mastercard","PYPL":"PayPal",
+    "COF":"Capital One","USB":"US Bancorp","TFC":"Truist","XOM":"ExxonMobil",
+    "CVX":"Chevron","OXY":"Occidental","COP":"ConocoPhillips","EOG":"EOG Resources",
+    "SLB":"Schlumberger","HAL":"Halliburton","MPC":"Marathon Petroleum","PSX":"Phillips 66",
+    "VLO":"Valero","DVN":"Devon Energy","FANG":"Diamondback","UNH":"UnitedHealth",
+    "JNJ":"J&J","PFE":"Pfizer","ABBV":"AbbVie","MRK":"Merck","LLY":"Eli Lilly",
+    "BMY":"Bristol-Myers","AMGN":"Amgen","GILD":"Gilead","REGN":"Regeneron",
+    "BIIB":"Biogen","VRTX":"Vertex","ISRG":"Intuitive Surgical","WMT":"Walmart",
+    "COST":"Costco","TGT":"Target","HD":"Home Depot","LOW":"Lowe's","MCD":"McDonald's",
+    "SBUX":"Starbucks","NKE":"Nike","LULU":"Lululemon","TJX":"TJX Companies",
+    "ROST":"Ross Stores","DG":"Dollar General","DLTR":"Dollar Tree","GE":"GE Aerospace",
+    "HON":"Honeywell","MMM":"3M","CAT":"Caterpillar","DE":"John Deere","BA":"Boeing",
+    "RTX":"Raytheon","LMT":"Lockheed Martin","NOC":"Northrop Grumman","GD":"General Dynamics",
+    "DIS":"Disney","CMCSA":"Comcast","CHTR":"Charter","T":"AT&T","VZ":"Verizon",
+    "TMUS":"T-Mobile","SNAP":"Snap","PINS":"Pinterest","SPOT":"Spotify",
+    "PLTR":"Palantir","COIN":"Coinbase","MSTR":"MicroStrategy","HOOD":"Robinhood",
+    "SOFI":"SoFi","RBLX":"Roblox","DKNG":"DraftKings","ABNB":"Airbnb",
+    "UBER":"Uber","LYFT":"Lyft","RIVN":"Rivian","LCID":"Lucid","NIO":"NIO",
+    "XPEV":"XPeng","LI":"Li Auto","F":"Ford","GM":"General Motors","BTBT":"Bit Digital",
+    "SPY":"S&P 500 ETF","QQQ":"Nasdaq ETF","IWM":"Russell 2000","GLD":"Gold ETF",
+    "SLV":"Silver ETF","TLT":"20yr Treasury","HYG":"High Yield Bond","XLE":"Energy ETF",
+    "XLF":"Financials ETF","XLK":"Tech ETF","XLV":"Health ETF","ARKK":"ARK Innovation",
+    "MARA":"Marathon Digital","RIOT":"Riot Platforms","HUT":"Hut 8","CLSK":"CleanSpark",
+    "CIFR":"Cipher Mining","BTC-USD":"Bitcoin","ETH-USD":"Ethereum","BNB-USD":"BNB",
+    "XRP-USD":"XRP","SOL-USD":"Solana","ADA-USD":"Cardano","DOGE-USD":"Dogecoin",
+    "AVAX-USD":"Avalanche","SHIB-USD":"Shiba Inu","DOT-USD":"Polkadot","LINK-USD":"Chainlink",
+    "MATIC-USD":"Polygon","LTC-USD":"Litecoin","BCH-USD":"Bitcoin Cash","UNI-USD":"Uniswap",
+    "ATOM-USD":"Cosmos","XLM-USD":"Stellar","ALGO-USD":"Algorand","INJ-USD":"Injective",
+    "NEAR-USD":"NEAR Protocol","AAVE-USD":"Aave","ARB-USD":"Arbitrum","OP-USD":"Optimism",
+    "SUI-USD":"Sui","APT-USD":"Aptos","STX-USD":"Stacks","HBAR-USD":"Hedera",
+    "VET-USD":"VeChain","EGLD-USD":"MultiversX","THETA-USD":"Theta","IMX-USD":"Immutable",
+    "SAND-USD":"The Sandbox","MANA-USD":"Decentraland","GRT-USD":"The Graph",
+    "CHZ-USD":"Chiliz","CRO-USD":"Cronos","FTM-USD":"Fantom","GALA-USD":"Gala",
+    "ENS-USD":"ENS","CAKE-USD":"PancakeSwap","COMP-USD":"Compound","TWT-USD":"Trust Wallet",
+    "SUSHI-USD":"SushiSwap","YFI-USD":"Yearn Finance","SNX-USD":"Synthetix",
+    "BAL-USD":"Balancer","FIL-USD":"Filecoin","ICP-USD":"Internet Computer",
+}
+
+
+def build_nightly_tab() -> html.Div:
+    """Nightly full-market scan results — best signals from TSX + NYSE + Crypto."""
+    scan_date  = get_nightly_scan_date()
+    today      = date.today().isoformat()
+    is_fresh   = scan_date == today
+    best       = load_nightly_best(min_stage=2, min_conviction=40, limit=60)
+
+    # Enrich names
+    for r in best:
+        if r.get("name","") == r.get("ticker","") or not r.get("name"):
+            r["name"] = NAME_MAP.get(r["ticker"], r["ticker"])
+
+    # Split by market
+    tsx_rows    = [r for r in best if r.get("market") == "tsx"]
+    nyse_rows   = [r for r in best if r.get("market") == "nyse"]
+    crypto_rows = [r for r in best if r.get("market") == "crypto"]
+
+    total_scanned = len(TSX_FULL) + len(NYSE_FULL) + len(CRYPTO_FULL_TICKERS)
+
+    # Which tickers are already on the grid
+    from tsunami_engine import WATCHLIST
+    wl          = get_full_watchlist()
+    on_grid     = set(wl.keys())
+    custom_list = {c["ticker"] for c in load_custom_tickers()}
+
+    # Status header
+    if scan_date:
+        status_color = "#00e676" if is_fresh else "#f57c00"
+        status_text  = f"Scanned {today} — {len(best)} signals found" if is_fresh else f"Last scan: {scan_date} — run tonight or manually"
+    else:
+        status_color = "#455a64"
+        status_text  = "No scan yet — click Scan Now or wait for midnight"
+
+    def build_signal_row(r: dict) -> html.Tr:
+        ticker   = r["ticker"]
+        state    = r.get("state","neutral")
+        stage    = r.get("stage", 0)
+        conv     = r.get("conviction", 0)
+        color    = STATE_COLOR.get(state, "#455a64")
+        emoji    = STATE_EMOJI.get(state, "")
+        price    = r.get("price")
+        pct5     = r.get("pct_5d")
+        pct20    = r.get("pct_20d")
+        pct5_str, pct5c   = fmt_pct(pct5)
+        pct20_str,pct20c  = fmt_pct(pct20)
+        price_str = fmt_price(price, ticker) if price else "—"
+        name      = r.get("name", ticker)
+
+        # Direction — 20d trend is the primary signal
+        # Negative 20d = falling regime (bearish) even if state says "Breaking Out"
+        pct20_val = r.get("pct_20d") or 0
+        pct5_val  = r.get("pct_5d")  or 0
+        if pct20_val < -5:
+            is_bullish = False
+        elif pct20_val > 5:
+            is_bullish = True
+        else:
+            is_bullish = pct5_val >= 0
+        dir_arrow = html.Span("▲", style={"color":"#00e676","fontWeight":"700","fontSize":"12px","marginRight":"4px"}) if is_bullish else                     html.Span("▼", style={"color":"#ff1744","fontWeight":"700","fontSize":"12px","marginRight":"4px"})
+
+        # Add to Grid button
+        already_on = ticker in on_grid
+        safe_id    = ticker.replace(".","__").replace("^","__").replace("=","__")
+        if already_on:
+            add_btn = html.Span("✓ On Grid",
+                style={"color":"#00e676","fontSize":"10px","fontWeight":"600","padding":"3px 8px",
+                       "border":"1px solid #00e67640","borderRadius":"4px"})
+        else:
+            add_btn = html.Button("+ Grid",
+                id={"type":"nightly-add","ticker":ticker,"name":name},
+                n_clicks=0,
+                style={"background":"#1a237e","color":"#7986cb","border":"1px solid #3949ab",
+                       "borderRadius":"4px","padding":"3px 10px","cursor":"pointer",
+                       "fontSize":"10px","fontWeight":"700"})
+
+        return html.Tr([
+            html.Td([
+                dir_arrow,
+                html.Span(ticker, style={"fontWeight":"700","color":TEXT_PRI,"fontSize":"13px","marginRight":"6px"}),
+                html.Div(name[:25], style={"color":TEXT_DIM,"fontSize":"10px","marginTop":"1px"}),
+            ], style={"padding":"8px 10px","minWidth":"140px"}),
+            html.Td(price_str,
+                style={"padding":"8px 10px","color":TEXT_PRI,"fontSize":"12px","textAlign":"right","whiteSpace":"nowrap"}),
+            html.Td(html.Span(pct5_str, style={"color":pct5c,"fontWeight":"600"}),
+                style={"padding":"8px 10px","textAlign":"right","fontSize":"12px"}),
+            html.Td(html.Span(pct20_str, style={"color":pct20c,"fontWeight":"600"}),
+                style={"padding":"8px 10px","textAlign":"right","fontSize":"12px"}),
+            html.Td([
+                html.Span(f"{emoji} {STATE_LABEL.get(state,state)}",
+                    style={"background":color,"color":"white","fontSize":"9px",
+                           "padding":"2px 7px","borderRadius":"4px","fontWeight":"700"}),
+            ], style={"padding":"8px 10px","whiteSpace":"nowrap"}),
+            html.Td(f"S{stage}",
+                style={"padding":"8px 10px","color":color,"fontWeight":"700","fontSize":"12px","textAlign":"center"}),
+            html.Td(str(conv),
+                style={"padding":"8px 10px","color":score_color(conv),"fontWeight":"900","fontSize":"13px","textAlign":"center"}),
+            html.Td(add_btn, style={"padding":"8px 10px","textAlign":"center","whiteSpace":"nowrap"}),
+        ], style={"borderBottom":f"1px solid {BORDER}","background":f"{color}08"})
+
+    th_s = {"padding":"8px 10px","color":TEXT_DIM,"fontSize":"10px","textTransform":"uppercase",
+            "fontWeight":"700","borderBottom":f"1px solid {BORDER}","background":BG_DEEP,"textAlign":"left"}
+    th_r = {**th_s,"textAlign":"right"}
+    th_c = {**th_s,"textAlign":"center"}
+
+    def market_table(rows: list[dict], label: str, icon: str) -> html.Div:
+        if not rows:
+            return html.Div([
+                html.Div(f"{icon} {label}",
+                    style={"fontSize":"13px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"8px"}),
+                html.Div("No signals above threshold in last scan.",
+                    style={"color":TEXT_DIM,"fontSize":"12px","fontStyle":"italic","padding":"12px 0"}),
+            ], style={"background":BG_CARD,"borderRadius":"10px","padding":"16px 20px","marginBottom":"12px"})
+
+        already_count = sum(1 for r in rows if r["ticker"] in on_grid)
+        new_count     = len(rows) - already_count
+
+        return html.Div([
+            html.Div([
+                html.Span(f"{icon} {label}",
+                    style={"fontSize":"13px","fontWeight":"700","color":TEXT_PRI}),
+                html.Span(f"  {len(rows)} signals",
+                    style={"fontSize":"11px","color":TEXT_DIM,"marginLeft":"8px"}),
+                html.Span(f"  · {new_count} new",
+                    style={"fontSize":"11px","color":"#7986cb","marginLeft":"4px"}) if new_count else html.Span(),
+            ], style={"marginBottom":"12px"}),
+            html.Div([
+                html.Table([
+                    html.Thead(html.Tr([
+                        html.Th("Ticker / Name", style=th_s),
+                        html.Th("Price",  style=th_r),
+                        html.Th("5d",     style=th_r),
+                        html.Th("20d",    style=th_r),
+                        html.Th("Regime", style=th_s),
+                        html.Th("Stage",  style=th_c),
+                        html.Th("Conv",   style=th_c),
+                        html.Th("Grid",   style=th_c),
+                    ])),
+                    html.Tbody([build_signal_row(r) for r in rows]),
+                ], style={"width":"100%","borderCollapse":"collapse","minWidth":"650px"}),
+            ], style={"overflowX":"auto"}),
+        ], style={"background":BG_CARD,"borderRadius":"10px","padding":"16px 20px","marginBottom":"12px"})
+
+    # Auto-promote section
+    auto_candidates = [r for r in best if r.get("stage",0) >= 4
+                       and r.get("conviction",0) >= 50
+                       and r["ticker"] not in on_grid]
+
+    auto_section = html.Div()
+    if auto_candidates:
+        auto_section = html.Div([
+            html.Div([
+                html.Div([
+                    html.Span("⚡ Auto-Promote Candidates",
+                        style={"fontSize":"13px","fontWeight":"700","color":"#ec407a"}),
+                    html.Span(f"  {len(auto_candidates)} stocks at Stage 4+ · conviction 50+",
+                        style={"fontSize":"11px","color":TEXT_DIM,"marginLeft":"8px"}),
+                ]),
+                html.Button("+ Add All to Grid",
+                    id="nightly-promote-all-btn", n_clicks=0,
+                    style={"background":"#1a237e","color":"white","border":"1px solid #3949ab",
+                           "borderRadius":"6px","padding":"7px 16px","cursor":"pointer",
+                           "fontSize":"12px","fontWeight":"700"}),
+            ], style={"display":"flex","justifyContent":"space-between","alignItems":"center","marginBottom":"10px"}),
+            html.Div([
+                html.Span(f"{NAME_MAP.get(r['ticker'],r['ticker'])} ({r['ticker']}) S{r['stage']} · {r['conviction']}",
+                    style={"background":"#1a237e","color":"#7986cb","fontSize":"10px",
+                           "padding":"3px 8px","borderRadius":"4px","marginRight":"6px","marginBottom":"4px",
+                           "display":"inline-block"})
+                for r in auto_candidates
+            ]),
+            html.Div(id="nightly-promote-status",
+                style={"color":TEXT_DIM,"fontSize":"11px","marginTop":"6px"}),
+        ], style={"background":"#0d1330","border":"1px solid #3949ab","borderRadius":"10px",
+                  "padding":"16px 20px","marginBottom":"16px"})
+
+    return html.Div([
+        html.Div([
+            html.Div([
+                html.Div("🌙 Nightly Universe Scan",
+                    style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI}),
+                html.Div(f"{total_scanned} stocks + crypto scanned · midnight auto-scan enabled",
+                    style={"color":TEXT_DIM,"fontSize":"12px","marginTop":"3px"}),
+                html.Div(status_text,
+                    style={"color":status_color,"fontSize":"11px","marginTop":"4px"}),
+            ]),
+            html.Div([
+                html.Div([
+                    html.Button("🌙 Scan Now", id="nightly-scan-btn", n_clicks=0,
+                        style={"background":"#1a237e","color":"white","border":"1px solid #3949ab",
+                               "borderRadius":"8px","padding":"9px 18px","cursor":"pointer",
+                               "fontWeight":"600","fontSize":"13px","marginRight":"8px"}),
+                    html.Button("🍁 TSX", id="nightly-tsx-btn", n_clicks=0,
+                        style={"background":BG_DEEP,"color":TEXT_SEC,"border":f"1px solid {BORDER}",
+                               "borderRadius":"8px","padding":"9px 12px","cursor":"pointer","fontSize":"12px","marginRight":"4px"}),
+                    html.Button("🇺🇸 US", id="nightly-nyse-btn", n_clicks=0,
+                        style={"background":BG_DEEP,"color":TEXT_SEC,"border":f"1px solid {BORDER}",
+                               "borderRadius":"8px","padding":"9px 12px","cursor":"pointer","fontSize":"12px","marginRight":"4px"}),
+                    html.Button("₿ Crypto", id="nightly-crypto-btn", n_clicks=0,
+                        style={"background":BG_DEEP,"color":TEXT_SEC,"border":f"1px solid {BORDER}",
+                               "borderRadius":"8px","padding":"9px 12px","cursor":"pointer","fontSize":"12px"}),
+                ], style={"display":"flex","alignItems":"center"}),
+                html.Div(id="nightly-scan-status",
+                    style={"color":TEXT_DIM,"fontSize":"11px","marginTop":"6px","textAlign":"right"}),
+            ]),
+        ], style={"display":"flex","justifyContent":"space-between","alignItems":"flex-start",
+                  "marginBottom":"16px","paddingBottom":"16px","borderBottom":f"1px solid {BORDER}"}),
+
+        html.Div([
+            *[html.Div([
+                html.Div(label, style={"fontSize":"10px","color":TEXT_DIM,"textTransform":"uppercase","marginBottom":"4px"}),
+                html.Div(str(count), style={"fontSize":"22px","fontWeight":"800","color":color}),
+                html.Div("signals", style={"fontSize":"10px","color":TEXT_DIM}),
+            ], style={"background":BG_DEEP,"borderRadius":"8px","padding":"12px 16px","textAlign":"center","flex":"1"})
+            for label, count, color in [
+                ("🍁 TSX",   len(tsx_rows),    "#ef5350"),
+                ("🇺🇸 US",    len(nyse_rows),   "#42a5f5"),
+                ("₿ Crypto", len(crypto_rows), "#f57c00"),
+                ("Total",    len(best),         TEXT_PRI),
+            ]],
+        ], style={"display":"flex","gap":"10px","marginBottom":"16px"}),
+
+        auto_section,
+
+        market_table(tsx_rows,    "TSX",           "🍁"),
+        market_table(nyse_rows,   "NYSE / NASDAQ",  "🇺🇸"),
+        market_table(crypto_rows, "Crypto",         "₿"),
+    ])
+
+
+def build_intelligence_tab(rows):
+    all_active = sorted([r for r in rows if r.get("stage",0)>=2],key=lambda r:conviction_score(r),reverse=True)
+    # Only show assets with conviction > 40 — below that there's nothing actionable
+    active = [r for r in all_active if conviction_score(r) > 40]
+    if not active:
+        return html.Div([
+            html.Div("🧠 Tsunami Intelligence",style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"8px"}),
+            html.Div("No assets above conviction 40 right now — all signals are early or weak.",
+                style={"color":TEXT_DIM,"textAlign":"center","padding":"60px","fontSize":"14px","fontStyle":"italic"}),
+        ])
+    return html.Div([
+        html.Div([
+            html.Div("🧠 Tsunami Intelligence",style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI}),
+            html.Div(f"{len(active)} assets · conviction > 40 · sorted by conviction"
+                     + (f" · {len(all_active)-len(active)} below threshold hidden" if len(all_active)>len(active) else ""),
+                style={"color":TEXT_DIM,"fontSize":"12px","marginTop":"3px"})],
             style={"marginBottom":"20px","paddingBottom":"16px","borderBottom":f"1px solid {BORDER}"}),
         *[intelligence_card(r,get_or_generate(r)) for r in active],
     ])
@@ -561,77 +1417,117 @@ def build_validation_tab():
     ])
 
 def build_trades_tab(rows):
+    """Clean watchlist manager — add/remove tickers, see what's being tracked."""
     cadusd = get_cadusd_rate()
     custom = load_custom_tickers()
+    wl     = get_full_watchlist()
 
-    # Custom ticker rows with prominent remove button
-    custom_rows = []
-    for c in custom:
-        flag = "🍁" if c["ticker"].endswith(".TO") else "🇺🇸"
-        safe_id = c["ticker"].replace(".", "_").replace("^", "_").replace("=", "_")
-        custom_rows.append(html.Div([
+    # All currently tracked tickers with their scan state
+    tracked = []
+    for ticker, info in wl.items():
+        if info.get("category") in ("FX","Index"): continue
+        scan = next((r for r in rows if r["ticker"]==ticker), None)
+        state = scan.get("state","neutral") if scan else "—"
+        stage = scan.get("stage",0) if scan else 0
+        price = scan.get("price") if scan else None
+        is_custom = any(c["ticker"]==ticker for c in custom)
+        tracked.append({"ticker":ticker,"label":info["label"],"state":state,
+                        "stage":stage,"price":price,"custom":is_custom,
+                        "category":info.get("category","")})
+    tracked = sorted(tracked, key=lambda r: r["stage"], reverse=True)
+
+    # Build compact ticker rows — one per line, clean
+    ticker_rows = []
+    for t in tracked:
+        color  = STATE_COLOR.get(t["state"],"#455a64")
+        emoji  = STATE_EMOJI.get(t["state"],"")
+        flag   = "🍁" if t["ticker"].endswith(".TO") else ""
+        price_str = fmt_price(t["price"], t["ticker"]) if t["price"] else "—"
+        safe_id = t["ticker"].replace(".","_").replace("^","_").replace("=","_")
+        remove_btn = html.Button("✕",
+            id={"type":"remove-ticker","index":safe_id}, n_clicks=0,
+            style={"background":"none","border":"none","color":"#ef535070",
+                   "cursor":"pointer","fontSize":"13px","padding":"2px 6px",
+                   "borderRadius":"4px"}) if t["custom"] else html.Span()
+
+        ticker_rows.append(html.Div([
             html.Div([
-                html.Span(flag, style={"marginRight":"8px","fontSize":"16px"}),
-                html.Div([
-                    html.Span(c["ticker"], style={"fontWeight":"700","color":TEXT_PRI,"fontSize":"14px","marginRight":"6px"}),
-                    html.Span(c["label"], style={"color":TEXT_DIM,"fontSize":"12px"}),
-                ]),
+                html.Span(f"{emoji} ", style={"fontSize":"12px","width":"20px","display":"inline-block"}),
+                html.Span(t["ticker"], style={"fontWeight":"700","color":TEXT_PRI,
+                    "fontSize":"13px","width":"100px","display":"inline-block"}),
+                html.Span(t["label"][:28], style={"color":TEXT_DIM,"fontSize":"12px",
+                    "width":"200px","display":"inline-block"}),
+                html.Span(flag, style={"fontSize":"11px","width":"20px","display":"inline-block"}),
+            ], style={"display":"flex","alignItems":"center","flex":"1"}),
+            html.Div([
+                html.Span(price_str, style={"color":TEXT_PRI,"fontWeight":"600",
+                    "fontSize":"13px","width":"80px","display":"inline-block","textAlign":"right"}),
+                html.Span(STATE_LABEL.get(t["state"],t["state"]) if t["state"]!="—" else "—",
+                    style={"background":color if t["state"]!="—" else "transparent",
+                           "color":"white" if t["state"]!="—" else TEXT_DIM,
+                           "fontSize":"9px","padding":"2px 7px","borderRadius":"4px",
+                           "fontWeight":"700","marginLeft":"10px","width":"90px",
+                           "display":"inline-block","textAlign":"center"}),
+                html.Span(remove_btn, style={"marginLeft":"10px","width":"30px"}),
             ], style={"display":"flex","alignItems":"center"}),
-            html.Button("✕ Remove",
-                id={"type":"remove-ticker","index":safe_id},
-                n_clicks=0,
-                style={"background":"#3a1a1a","border":"1px solid #ef535080","color":"#ef5350",
-                       "borderRadius":"8px","padding":"8px 16px","cursor":"pointer",
-                       "fontSize":"12px","fontWeight":"700"}),
         ], style={"display":"flex","justifyContent":"space-between","alignItems":"center",
-                  "padding":"14px 16px","borderRadius":"8px","marginBottom":"8px",
-                  "background":BG_DEEP,"border":f"1px solid {BORDER}"}))
+                  "padding":"7px 12px","borderBottom":f"1px solid {BORDER}",
+                  "background":BG_CARD if t["custom"] else "transparent",
+                  "borderLeft":f"3px solid {color}" if t["custom"] else "3px solid transparent",
+                  "borderRadius":"4px","marginBottom":"2px"}))
 
     return html.Div([
         # Header
         html.Div([
-            html.Div("➕ Add Assets", style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI}),
-            html.Div(f"Custom assets always appear on the grid  ·  CA$1 = US${cadusd:.4f}",
-                style={"color":TEXT_DIM,"fontSize":"12px","marginTop":"3px"}),
-        ], style={"marginBottom":"24px","paddingBottom":"16px","borderBottom":f"1px solid {BORDER}"}),
-
-        # Add ticker
-        html.Div([
-            html.Div("Add a ticker to your watchlist",
-                style={"fontSize":"13px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"4px"}),
-            html.Div("US stocks: MSFT, AAPL · Canadian (TSX): RY.TO, TD.TO, SHOP.TO",
-                style={"fontSize":"11px","color":TEXT_DIM,"marginBottom":"12px"}),
             html.Div([
-                dcc.Input(id="ticker-input", type="text", placeholder="e.g. RY.TO or MSFT",
+                html.Div("📡 Watchlist", style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI}),
+                html.Div(f"{len(tracked)} assets tracked  ·  CA$1 = US${cadusd:.4f}",
+                    style={"color":TEXT_DIM,"fontSize":"12px","marginTop":"3px"}),
+            ]),
+            # Add ticker inline
+            html.Div([
+                dcc.Input(id="ticker-input", type="text", placeholder="MSFT or RY.TO",
                     debounce=True,
                     style={"background":BG_DEEP,"color":TEXT_PRI,"border":f"1px solid {BORDER}",
-                           "borderRadius":"6px","padding":"9px 14px","fontSize":"13px",
-                           "width":"160px","outline":"none"}),
-                dcc.Input(id="ticker-label", type="text", placeholder="Nickname (optional)",
+                           "borderRadius":"6px 0 0 6px","padding":"8px 12px","fontSize":"13px",
+                           "width":"130px","outline":"none"}),
+                dcc.Input(id="ticker-label", type="text", placeholder="Nickname",
                     style={"background":BG_DEEP,"color":TEXT_PRI,"border":f"1px solid {BORDER}",
-                           "borderRadius":"6px","padding":"9px 14px","fontSize":"13px",
-                           "width":"180px","marginLeft":"8px","outline":"none"}),
-                html.Button("+ Add",id="add-ticker-btn",n_clicks=0,
-                    style={"background":"#66bb6a","color":"white","border":"none","borderRadius":"6px",
-                           "padding":"9px 18px","cursor":"pointer","fontSize":"13px",
-                           "marginLeft":"8px","fontWeight":"700"}),
+                           "borderLeft":"none","padding":"8px 12px","fontSize":"13px",
+                           "width":"120px","outline":"none"}),
+                html.Button("+ Add", id="add-ticker-btn", n_clicks=0,
+                    style={"background":ACCENT,"color":"white","border":"none",
+                           "borderRadius":"0 6px 6px 0","padding":"8px 14px",
+                           "cursor":"pointer","fontSize":"13px","fontWeight":"700"}),
                 html.Span(id="ticker-status",
-                    style={"color":TEXT_DIM,"fontSize":"12px","marginLeft":"12px"}),
+                    style={"color":TEXT_DIM,"fontSize":"11px","marginLeft":"10px"}),
             ], style={"display":"flex","alignItems":"center"}),
-        ], style={"background":BG_CARD,"borderRadius":"10px","padding":"20px","marginBottom":"20px"}),
+        ], style={"display":"flex","justifyContent":"space-between","alignItems":"center",
+                  "marginBottom":"16px","paddingBottom":"16px","borderBottom":f"1px solid {BORDER}"}),
 
-        # Custom ticker list
+        # Column headers
         html.Div([
-            html.Div(f"Your Assets ({len(custom)})",
-                style={"fontSize":"13px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"4px"}),
-            html.Div("These always appear on the grid regardless of their current stage",
-                style={"fontSize":"11px","color":TEXT_DIM,"marginBottom":"16px"}),
-            *(custom_rows if custom_rows else [
-                html.Div("No custom tickers added yet.",
-                    style={"color":TEXT_DIM,"fontSize":"13px","fontStyle":"italic","padding":"12px 0"}),
+            html.Span("Ticker / Name", style={"color":TEXT_DIM,"fontSize":"10px",
+                "textTransform":"uppercase","flex":"1"}),
+            html.Div([
+                html.Span("Price", style={"color":TEXT_DIM,"fontSize":"10px",
+                    "textTransform":"uppercase","width":"80px","textAlign":"right","display":"inline-block"}),
+                html.Span("Regime", style={"color":TEXT_DIM,"fontSize":"10px",
+                    "textTransform":"uppercase","width":"90px","textAlign":"center",
+                    "display":"inline-block","marginLeft":"10px"}),
+                html.Span("", style={"width":"40px","display":"inline-block"}),
             ]),
-        ], style={"background":BG_CARD,"borderRadius":"10px","padding":"20px"}),
+        ], style={"display":"flex","justifyContent":"space-between","padding":"4px 12px",
+                  "marginBottom":"6px"}),
+
+        # Ticker list
+        html.Div(ticker_rows, style={"maxHeight":"70vh","overflowY":"auto"}),
+
+        html.Div("🍁 Highlighted = your custom tickers  ·  Click ✕ to remove from watchlist",
+            style={"color":TEXT_DIM,"fontSize":"10px","marginTop":"12px",
+                   "fontStyle":"italic","textAlign":"center"}),
     ])
+
 
 def conviction_score_uni(r):
     """Conviction score for universe scan rows (different field names)."""
@@ -928,13 +1824,17 @@ app.config.suppress_callback_exceptions=True
 app.layout=html.Div([
     dcc.Interval(id="active-refresh",interval=30*60*1000,n_intervals=0),
     dcc.Interval(id="passive-refresh",interval=60*60*1000,n_intervals=0),
-    dcc.Interval(id="price-poll",interval=15*60*1000,n_intervals=0),  # 15-min live price poll
+    dcc.Interval(id="price-poll",interval=15*60*1000,n_intervals=0),  # 15-min full price poll
+    dcc.Interval(id="position-poll",interval=60*1000,n_intervals=0),     # 60-sec open position refresh
     dcc.Store(id="selected-ticker",data=None),
     dcc.Store(id="all-rows",data=[]),
     dcc.Store(id="live-prices",data={}),  # ticker -> live price (float)
     dcc.Store(id="alert-signals",data=[]),  # current GET IN signals
     dcc.Store(id="show-all-grid",data=False),  # toggle quiet stocks
     dcc.Store(id="pending-trade",data=None),   # trade ticket awaiting confirmation
+    dcc.Store(id="ticket-mode",data="shares"),  # "shares" or "dollars"
+    dcc.Store(id="notification-data",data=None),
+    html.Div(id="notification-trigger",style={"display":"none"}),
     html.Div([
         html.Div([
             html.H1("🌊 Tsunami",style={"margin":"0","fontSize":"26px","fontWeight":"800","color":TEXT_PRI}),
@@ -956,6 +1856,8 @@ app.layout=html.Div([
         dcc.Tab(label="➕ Add Assets",value="trades",style=TAB_STYLE,selected_style=TAB_SEL),
         dcc.Tab(label="📝 Paper",value="paper",style=TAB_STYLE,selected_style=TAB_SEL),
         dcc.Tab(label="🔭 Universe",value="universe",style=TAB_STYLE,selected_style=TAB_SEL),
+        dcc.Tab(label="🌙 Nightly",value="nightly",style=TAB_STYLE,selected_style=TAB_SEL),
+        dcc.Tab(label="🏦 Portfolio",value="portfolio",style=TAB_STYLE,selected_style=TAB_SEL),
         dcc.Tab(id="alerts-tab",label="🚨 Alerts",value="alerts",style=TAB_STYLE,selected_style={**TAB_SEL,"background":"#b71c1c","borderColor":"#ef5350"}),
     ],style={"marginBottom":"0"},colors={"border":BORDER,"primary":ACCENT,"background":BG_PANEL}),
     html.Div(id="tab-content",style={"paddingTop":"20px"}),
@@ -975,9 +1877,14 @@ def _price_worker() -> None:
     all-rows every 15 minutes. Writes results into _live_price_cache.
     Also monitors open paper trades for exit conditions.
     Never raises — failures are silently skipped so the grid is never broken.
+    Runs immediately on first start, then every 15 minutes.
     """
     import yfinance as yf
+    first_run = True
     while True:
+        if not first_run:
+            time.sleep(15 * 60)
+        first_run = False
         try:
             rows = load_latest() or []
             tickers = [r["ticker"] for r in rows if r.get("ticker")]
@@ -1022,7 +1929,6 @@ def _price_worker() -> None:
 
         except Exception:
             pass
-        time.sleep(15 * 60)  # 15-minute cadence — matches price-poll interval
 
 def _start_price_thread() -> None:
     global _price_thread_started
@@ -1037,9 +1943,12 @@ def get_live_price_snapshot() -> dict[str, float]:
         return dict(_live_price_cache)
 
 _start_price_thread()  # safe here — function is now defined
+start_nightly_scheduler()  # midnight full market scan
 
 @app.callback(
-    Output("bucket-row","children"),Output("last-updated","children"),Output("all-rows","data"),
+    Output("bucket-row","children"),Output("last-updated","children"),
+    Output("all-rows","data"),Output("live-prices","data"),
+    Output("notification-data","data"),
     Input("active-refresh","n_intervals"),Input("passive-refresh","n_intervals"),Input("scan-btn","n_clicks"),
 )
 def refresh_data(active_n,passive_n,scan_clicks):
@@ -1054,7 +1963,18 @@ def refresh_data(active_n,passive_n,scan_clicks):
     active_count=sum(1 for r in rows if r.get("stage",0)>=2)
     refresh_note="30min" if active_count>0 else "1hr"
     upd=f"Updated: {date.today().strftime('%A %B %d, %Y')} · {len(rows)} assets · refresh {refresh_note}"
-    return brow,upd,rows
+    # Bundle the latest price cache with every data refresh.
+    # This is the primary delivery path — price-poll is a secondary top-up.
+    prices=get_live_price_snapshot()
+    # Build notification payload for client-side target check
+    try:
+        tally = get_pnl_tally()
+        daily_target = get_daily_target()
+        notif = json.dumps({"target_hit": daily_target>0 and tally["today"]>=daily_target,
+                            "today": tally["today"], "target": daily_target})
+    except Exception:
+        notif = None
+    return brow,upd,rows,prices,notif
 
 @app.callback(Output("scan-status","children"),Input("scan-btn","n_clicks"),prevent_initial_call=True)
 def scan_status(n):
@@ -1146,46 +2066,55 @@ def paper_trade_from_detail(n_clicks_list, rows):
     Output("ticket-live-calc","children"),
     Input("ticket-price","value"),
     Input("ticket-shares","value"),
+    Input("ticket-dollars","value"),
     Input("ticket-stop","value"),
+    Input("ticket-mode","data"),
     State("ticket-data","data"),
     prevent_initial_call=True,
 )
-def update_ticket_calc(price, shares, stop, ticket_data):
-    """Live-update the calculated totals as user edits ticket fields."""
-    if not price or not shares or not stop or not ticket_data:
+def update_ticket_calc(price, shares, dollars, stop, mode, ticket_data):
+    """Live calc — supports both share qty and dollar amount entry."""
+    if not price or not stop or not ticket_data:
         raise PreventUpdate
     try:
-        p  = float(price)
-        sh = float(shares)
-        st = float(stop)
+        p  = float(str(price).replace(",",""))
+        st = float(str(stop).replace(",",""))
         ticker    = ticket_data.get("ticker","")
         direction = ticket_data.get("direction","long")
-        pos_val   = p * sh
-        risk_amt  = abs(p - st) * sh
         is_long   = direction == "long"
-        pnl_at_stop = (st - p) * sh if is_long else (p - st) * sh
-        pnl_color = "#00e676" if pnl_at_stop >= 0 else "#ef5350"
 
+        # Derive shares from whichever input is active
+        if mode == "dollars" and dollars:
+            sh = float(dollars) / p if p else 0
+        elif shares:
+            sh = float(shares)
+        else:
+            raise PreventUpdate
+
+        pos_val     = p * sh
+        risk_amt    = abs(p - st) * sh
+        pnl_at_stop = (st - p) * sh if is_long else (p - st) * sh
+        risk_pct    = abs(p - st) / p * 100 if p else 0
+        pnl_color   = "#00e676" if pnl_at_stop >= 0 else "#ef5350"
+
+        # Determine display shares
+        display_sh = sh if mode=="dollars" else sh
         return html.Div([
             html.Div([
-                html.Div([
-                    html.Span("Total Cost  ", style={"color":TEXT_DIM,"fontSize":"12px"}),
-                    html.Span(fmt_price(pos_val, ticker),
-                        style={"fontSize":"20px","fontWeight":"900","color":TEXT_PRI}),
-                ]),
-                html.Div([
-                    html.Span("Max Loss  ", style={"color":TEXT_DIM,"fontSize":"12px"}),
-                    html.Span(f"-{fmt_price(risk_amt, ticker)}",
-                        style={"fontSize":"20px","fontWeight":"900","color":"#ef5350"}),
-                ]),
-                html.Div([
-                    html.Span("P&L at Stop  ", style={"color":TEXT_DIM,"fontSize":"12px"}),
-                    html.Span(f"{'+' if pnl_at_stop>=0 else ''}{fmt_price(abs(pnl_at_stop), ticker)}",
-                        style={"fontSize":"20px","fontWeight":"900","color":pnl_color}),
-                ]),
-            ], style={"display":"flex","gap":"24px","alignItems":"center",
-                      "background":BG_DEEP,"borderRadius":"8px","padding":"14px 18px",
-                      "border":f"1px solid {BORDER}"}),
+                *[html.Div([
+                    html.Div(lbl, style={"fontSize":"9px","color":TEXT_DIM,
+                        "textTransform":"uppercase","letterSpacing":"0.5px","marginBottom":"4px"}),
+                    html.Div(val, style={"fontSize":"15px","fontWeight":"700","color":clr}),
+                ], style={"textAlign":"center","flex":"1","padding":"10px 8px",
+                           "background":BG_DEEP,"borderRadius":"6px"})
+                for lbl, val, clr in [
+                    ("Shares",        f"{display_sh:,.1f}",                        TEXT_PRI),
+                    ("Position",      fmt_price(pos_val, ticker),                   TEXT_PRI),
+                    ("Max Loss",      f"-{fmt_price(risk_amt, ticker)}",            "#ef5350"),
+                    ("Risk %",        f"{risk_pct:.1f}%",                           "#f57c00"),
+                    ("P&L at Stop",   f"{'+'if pnl_at_stop>=0 else ''}{fmt_price(abs(pnl_at_stop),ticker)}", pnl_color),
+                ]],
+            ], style={"display":"flex","gap":"6px"}),
         ])
     except Exception:
         raise PreventUpdate
@@ -1220,44 +2149,157 @@ def close_paper_trade_cb(n_clicks_list):
     State("ticket-data","data"),
     State("ticket-price","value"),
     State("ticket-shares","value"),
+    State("ticket-dollars","value"),
     State("ticket-stop","value"),
     State("ticket-note","value"),
+    State("ticket-mode","data"),
     prevent_initial_call=True,
 )
 def handle_ticket(confirm_clicks, cancel_clicks, ticket_data,
-                  price, shares, stop, note):
+                  price, shares, dollars, stop, note, mode):
     """Handle confirm or cancel on the trade ticket."""
     triggered = ctx.triggered_id
     if triggered == "ticket-cancel-btn":
         return None, build_paper_tab(None), ""
 
     if triggered == "ticket-confirm-btn" and ticket_data:
-        if not price or not shares or not stop:
-            return ticket_data, build_paper_tab(ticket_data), "❌ Please fill in all price fields"
+        if not price or not stop:
+            return ticket_data, build_paper_tab(ticket_data), "❌ Enter price and stop"
         try:
-            atr = ticket_data.get("atr", abs(float(price) - float(stop)) / ATR_MULT)
-            sizing = position_size(float(price), float(stop),
-                                   ticket_data.get("conviction",50), get_portfolio_value())
+            p  = float(str(price).replace(",",""))
+            st = float(str(stop).replace(",",""))
+            # Resolve shares from dollars or qty
+            if dollars:
+                sh = float(dollars) / p if p else 0
+            elif shares:
+                sh = float(shares)
+            else:
+                return ticket_data, build_paper_tab(ticket_data), "❌ Enter quantity or dollar amount"
+            if sh <= 0:
+                return ticket_data, build_paper_tab(ticket_data), "❌ Quantity must be > 0"
+            atr = ticket_data.get("atr", abs(p - st) / ATR_MULT)
             open_paper_trade(
                 ticker         = ticket_data["ticker"],
                 direction      = ticket_data["direction"],
                 stage          = ticket_data.get("stage",0),
                 conviction     = ticket_data.get("conviction",50),
-                entry_price    = round(float(price),4),
-                stop_price     = round(float(stop),4),
+                entry_price    = round(p,4),
+                stop_price     = round(st,4),
                 atr            = round(float(atr),4),
-                shares         = round(float(shares),2),
-                dollar_risk    = round(float(shares) * abs(float(price)-float(stop)),2),
-                position_value = round(float(shares) * float(price),2),
+                shares         = round(sh,4),
+                dollar_risk    = round(sh * abs(p-st),2),
+                position_value = round(sh * p,2),
             )
             return None, build_paper_tab(None), ""
         except Exception as e:
-            return ticket_data, build_paper_tab(ticket_data), f"❌ Error: {str(e)[:60]}"
+            return ticket_data, build_paper_tab(ticket_data), f"❌ {str(e)[:60]}"
     raise PreventUpdate
 
-@app.callback(Output("live-prices","data"),Input("price-poll","n_intervals"))
-def update_live_prices(_):
-    """Drain the background thread's cache into the Dash store every 3 min."""
+@app.callback(
+    Output("ticket-mode","data"),
+    Output("ticket-shares","style"),
+    Output("ticket-dollars","style"),
+    Output("ticket-mode-shares","style"),
+    Output("ticket-mode-dollars","style"),
+    Input("ticket-mode-shares","n_clicks"),
+    Input("ticket-mode-dollars","n_clicks"),
+    prevent_initial_call=True,
+)
+def toggle_ticket_mode(shares_clicks, dollars_clicks):
+    """Switch between shares and dollar-amount entry."""
+    triggered = ctx.triggered_id
+    share_style_base = {"background":BG_DEEP,"color":"#f57c00","border":f"1px solid {BORDER}",
+                        "borderRadius":"6px","padding":"10px","fontSize":"20px","fontWeight":"700",
+                        "width":"120px","outline":"none"}
+    dollar_style_base= {"background":BG_DEEP,"color":"#f57c00","border":f"1px solid {BORDER}",
+                        "borderRadius":"6px","padding":"10px","fontSize":"20px","fontWeight":"700",
+                        "width":"140px","outline":"none"}
+    btn_on  = {"background":ACCENT,"color":"white","border":"none","fontSize":"12px","fontWeight":"700","cursor":"pointer","padding":"10px 14px"}
+    btn_off = {"background":BG_DEEP,"color":TEXT_DIM,"border":f"1px solid {BORDER}","fontSize":"12px","fontWeight":"700","cursor":"pointer","padding":"10px 14px"}
+    if triggered == "ticket-mode-dollars":
+        return ("dollars",
+                {**share_style_base, "display":"none"},
+                {**dollar_style_base,"display":"block"},
+                {**btn_off,"borderRadius":"6px 0 0 6px"},
+                {**btn_on, "borderRadius":"0 6px 6px 0"})
+    return ("shares",
+            {**share_style_base,"display":"block"},
+            {**dollar_style_base,"display":"none"},
+            {**btn_on, "borderRadius":"6px 0 0 6px"},
+            {**btn_off,"borderRadius":"0 6px 6px 0"})
+
+
+# Browser notification when daily target is hit
+app.clientside_callback(
+    """
+    function(tally_json) {
+        if (!tally_json) return '';
+        try {
+            var data = JSON.parse(tally_json);
+            if (data.target_hit) {
+                if ('Notification' in window) {
+                    if (Notification.permission === 'granted') {
+                        new Notification('🎯 Daily Target Hit!', {
+                            body: 'You\'ve hit your $' + data.target + ' target. Lock in profits.',
+                            icon: ''
+                        });
+                    } else if (Notification.permission !== 'denied') {
+                        Notification.requestPermission().then(function(p) {
+                            if (p === 'granted') {
+                                new Notification('🎯 Daily Target Hit!', {
+                                    body: 'You\'ve hit your $' + data.target + ' target.',
+                                });
+                            }
+                        });
+                    }
+                }
+            }
+        } catch(e) {}
+        return '';
+    }
+    """,
+    Output("notification-trigger","children"),
+    Input("notification-data","data"),
+)
+
+
+@app.callback(
+    Output("tab-content","children", allow_duplicate=True),
+    Input("position-poll","n_intervals"),
+    State("main-tabs","value"),
+    State("pending-trade","data"),
+    prevent_initial_call=True,
+)
+def refresh_open_positions(_, tab, pending):
+    """Refresh paper tab every 60 sec to show updated live prices on open positions."""
+    if tab != "paper":
+        raise PreventUpdate
+    # Re-fetch prices for open positions only — fast, targeted
+    import yfinance as yf
+    open_trades = load_open_paper_trades()
+    if not open_trades:
+        raise PreventUpdate
+    tickers = list({t["ticker"] for t in open_trades})
+    for ticker in tickers:
+        try:
+            price = yf.Ticker(ticker).fast_info.last_price
+            if price and float(price) > 0:
+                with _price_cache_lock:
+                    _live_price_cache[ticker] = float(price)
+        except Exception:
+            pass
+    return build_paper_tab(pending)
+
+
+@app.callback(
+    Output("live-prices","data", allow_duplicate=True),
+    Input("price-poll","n_intervals"),
+    prevent_initial_call=True,
+)
+def update_live_prices_poll(_):
+    """Secondary top-up: drain background cache into store every 15 min.
+    Primary delivery is via refresh_data which fires on load and active-refresh.
+    """
     return get_live_price_snapshot()
 
 @app.callback(
@@ -1267,16 +2309,21 @@ def update_live_prices(_):
 )
 def render_tab(tab,rows,selected_ticker,live_prices,show_all,pending_trade):
     if not rows:rows=load_latest()
+    if tab=="portfolio":return build_portfolio_tab(rows)
+    if tab=="nightly":return build_nightly_tab()
     if tab=="intelligence":return build_intelligence_tab(rows)
     if tab=="validation":return build_validation_tab()
     if tab=="universe":return build_universe_tab()
+    # Fall back to the in-process cache when the Dash store is still empty
+    # (this covers the cold-start window before the first price-poll fires)
+    effective_prices = live_prices or get_live_price_snapshot()
     if tab=="alerts":
-        if live_prices:
-            rows=[{**r,"price":live_prices[r["ticker"]]} if r["ticker"] in live_prices else r for r in rows]
+        if effective_prices:
+            rows=[{**r,"price":effective_prices[r["ticker"]]} if r["ticker"] in effective_prices else r for r in rows]
         portfolio   = get_portfolio_value()
         entry_sigs  = get_entry_signals(rows, portfolio)
         open_trades = load_open_trades()
-        exit_sigs   = check_exit_signals(open_trades, rows, live_prices or {})
+        exit_sigs   = check_exit_signals(open_trades, rows, effective_prices or {})
         return build_alerts_tab(entry_sigs, exit_sigs)
     if tab=="trades":
         fresh_rows=load_latest()
@@ -1290,9 +2337,9 @@ def render_tab(tab,rows,selected_ticker,live_prices,show_all,pending_trade):
     # Hide FX rates and indices from grid — reference data only
     wl=get_full_watchlist()
     grid_rows=[r for r in rows if wl.get(r["ticker"],{}).get("category") not in ("FX","Index")]
-    # Overlay live prices
-    if live_prices:
-        grid_rows=[{**r,"price":live_prices[r["ticker"]]} if r["ticker"] in live_prices else r
+    # Overlay live prices — use effective_prices (store OR in-process cache fallback)
+    if effective_prices:
+        grid_rows=[{**r,"price":effective_prices[r["ticker"]]} if r["ticker"] in effective_prices else r
                    for r in grid_rows]
     # Filter quiet/neutral unless show-all toggled
     QUIET_STATES   = {"neutral","insufficient_data","compressed","coiling"}
@@ -1591,168 +2638,386 @@ def build_trade_ticket(pending: dict) -> html.Div:
               "borderRadius":"12px","padding":"24px","marginBottom":"24px"})
 
 def build_paper_tab(pending: dict = None) -> html.Div:
-    """Paper trading tab — simulated trades with live price tracking."""
-    ticket        = build_trade_ticket(pending) if pending else html.Div()
+    """Clean trading blotter — ticket, open positions, closed history, P&L summary."""
     open_trades   = load_open_paper_trades()
     closed_trades = load_closed_paper_trades()
     scorecard     = paper_trade_scorecard()
     live          = get_live_price_snapshot()
+    tally         = get_pnl_tally()
+    daily_target  = get_daily_target()
 
-    # ── Scorecard ──
-    sc_items = []
-    if scorecard["closed"] > 0:
-        pf_str = f"{scorecard['profit_factor']}" if scorecard["profit_factor"] else "—"
-        sc_items = [
-            ("Trades", f"{scorecard['closed']} closed / {scorecard['open']} open"),
-            ("Win Rate", f"{scorecard['win_rate']}%"),
-            ("Total P&L", f"{'+'if scorecard['total_pnl']>=0 else ''}{scorecard['total_pnl']:,.2f}"),
-            ("Profit Factor", pf_str),
-            ("Mean Return", f"{scorecard['mean_pct']:+.2f}% / trade"),
-        ]
-    sc_cards = [html.Div([
-        html.Div(label, style={"fontSize":"10px","color":TEXT_DIM,"textTransform":"uppercase","marginBottom":"4px"}),
-        html.Div(value, style={"fontSize":"16px","fontWeight":"700","color":TEXT_PRI}),
-    ], style={"background":BG_DEEP,"borderRadius":"8px","padding":"12px 16px","textAlign":"center"})
-    for label, value in sc_items] if sc_items else [
-        html.Div("No closed trades yet — enter your first paper trade from the Alerts tab.",
-            style={"color":TEXT_DIM,"fontSize":"13px","fontStyle":"italic","padding":"20px 0"})
-    ]
+    today_pnl    = tally["today"]
+    week_pnl     = tally["week"]
+    month_pnl    = tally["month"]
+    target_hit   = daily_target > 0 and today_pnl >= daily_target
+    target_pct   = min(today_pnl / daily_target * 100, 100) if daily_target > 0 else 0
 
-    # ── Open positions ──
-    open_rows = []
+    def pc(v): return "#00e676" if v >= 0 else "#ff1744"
+    def pf(v): return f"{'+'if v>=0 else ''}{v:,.2f}"
+
+    # ── Trade ticket (shown when entering a trade) ──
+    if pending:
+        ticker    = pending.get("ticker","")
+        direction = pending.get("direction","long")
+        price     = pending.get("entry_price", 0)
+        stop      = pending.get("stop_price", 0)
+        shares    = pending.get("shares", 0)
+        is_long   = direction == "long"
+        ac        = "#00e676" if is_long else "#ff1744"
+        wl        = get_full_watchlist()
+        name      = wl.get(ticker,{}).get("label", ticker)
+        live_p    = live.get(ticker) or price
+
+        ticket = html.Div([
+            # Ticker header with live price
+            html.Div([
+                html.Div([
+                    html.Span(ticker, style={"fontSize":"26px","fontWeight":"900","color":TEXT_PRI,"marginRight":"10px"}),
+                    html.Span(name, style={"fontSize":"14px","color":TEXT_DIM}),
+                ]),
+                html.Div([
+                    html.Div(fmt_price(live_p, ticker),
+                        style={"fontSize":"28px","fontWeight":"900","color":ac,"lineHeight":"1"}),
+                    html.Div("LIVE", style={"fontSize":"9px","color":TEXT_DIM,
+                        "textTransform":"uppercase","letterSpacing":"1px","textAlign":"right"}),
+                ]),
+            ], style={"display":"flex","justifyContent":"space-between","alignItems":"center",
+                      "marginBottom":"20px","paddingBottom":"16px","borderBottom":f"1px solid {BORDER}"}),
+
+            # Buy / Sell toggle
+            html.Div([
+                html.Button("▲ BUY",  id="ticket-long-btn",  n_clicks=0,
+                    style={"background":"#00e676" if is_long else BG_DEEP,
+                           "color":"#080b12" if is_long else TEXT_DIM,
+                           "border":"2px solid #00e676","borderRadius":"6px 0 0 6px",
+                           "padding":"10px 24px","cursor":"pointer","fontWeight":"900","fontSize":"14px"}),
+                html.Button("▼ SELL", id="ticket-short-btn", n_clicks=0,
+                    style={"background":"#ff1744" if not is_long else BG_DEEP,
+                           "color":"white" if not is_long else TEXT_DIM,
+                           "border":"2px solid #ff1744","borderRadius":"0 6px 6px 0",
+                           "padding":"10px 24px","cursor":"pointer","fontWeight":"900","fontSize":"14px"}),
+            ], style={"display":"flex","marginBottom":"16px"}),
+
+            # Price + Stop row
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.Span("PRICE", style={"fontSize":"10px","color":TEXT_DIM,
+                            "textTransform":"uppercase","letterSpacing":"1px"}),
+                        html.Span(" · live", style={"fontSize":"10px","color":"#00e676"}),
+                    ], style={"marginBottom":"6px"}),
+                    dcc.Input(id="ticket-price", type="text",
+                        value=f"{live_p:.4f}" if live_p < 5 else f"{live_p:.2f}",
+                        style={"background":BG_DEEP,"color":TEXT_PRI,
+                               "border":f"2px solid {ac}","borderRadius":"8px",
+                               "padding":"10px 14px","fontSize":"16px","fontWeight":"700",
+                               "width":"100%","outline":"none"}),
+                ], style={"flex":"1"}),
+                html.Div([
+                    html.Div("STOP LOSS", style={"fontSize":"10px","color":TEXT_DIM,
+                        "textTransform":"uppercase","letterSpacing":"1px","marginBottom":"6px"}),
+                    dcc.Input(id="ticket-stop", type="text",
+                        value=f"{stop:.4f}" if stop < 5 else f"{stop:.2f}",
+                        style={"background":BG_DEEP,"color":"#ef5350",
+                               "border":f"1px solid {BORDER}","borderRadius":"8px",
+                               "padding":"10px 14px","fontSize":"16px","fontWeight":"700",
+                               "width":"100%","outline":"none"}),
+                ], style={"flex":"1"}),
+            ], style={"display":"flex","gap":"12px","marginBottom":"12px"}),
+
+            # Quantity — shares or dollar amount toggle
+            html.Div([
+                html.Div("QUANTITY", style={"fontSize":"10px","color":TEXT_DIM,
+                    "textTransform":"uppercase","letterSpacing":"1px","marginBottom":"6px"}),
+                html.Div([
+                    html.Button("# Shares",
+                        id="ticket-mode-shares", n_clicks=0,
+                        style={"background":ACCENT,"color":"white",
+                               "border":"none","borderRadius":"6px 0 0 6px",
+                               "padding":"11px 16px","cursor":"pointer",
+                               "fontSize":"12px","fontWeight":"700","whiteSpace":"nowrap"}),
+                    html.Button("$ Amount",
+                        id="ticket-mode-dollars", n_clicks=0,
+                        style={"background":BG_DEEP,"color":TEXT_DIM,
+                               "border":f"1px solid {BORDER}","borderRadius":"0 6px 6px 0",
+                               "padding":"11px 16px","cursor":"pointer",
+                               "fontSize":"12px","fontWeight":"700","whiteSpace":"nowrap"}),
+                    dcc.Input(id="ticket-shares", type="number",
+                        value=round(shares,0) if shares else None,
+                        placeholder="0",
+                        style={"background":BG_DEEP,"color":"#f57c00",
+                               "border":f"1px solid {BORDER}","borderRadius":"6px",
+                               "padding":"10px 14px","fontSize":"16px","fontWeight":"700",
+                               "width":"140px","outline":"none","marginLeft":"8px"}),
+                    dcc.Input(id="ticket-dollars", type="number",
+                        value=None, placeholder="0.00",
+                        style={"background":BG_DEEP,"color":"#f57c00",
+                               "border":f"1px solid {BORDER}","borderRadius":"6px",
+                               "padding":"10px 14px","fontSize":"16px","fontWeight":"700",
+                               "width":"160px","outline":"none","marginLeft":"8px",
+                               "display":"none"}),
+                ], style={"display":"flex","alignItems":"center"}),
+            ], style={"marginBottom":"12px"}),
+
+            # Live calc row
+            html.Div(id="ticket-live-calc", style={"marginBottom":"12px"}),
+
+            # Note + confirm
+            html.Div([
+                dcc.Input(id="ticket-note", type="text", placeholder="Notes (optional)",
+                    style={"background":BG_DEEP,"color":TEXT_PRI,"border":f"1px solid {BORDER}",
+                           "borderRadius":"6px","padding":"10px","fontSize":"13px",
+                           "flex":"1","outline":"none"}),
+                html.Button("✓ Confirm", id="ticket-confirm-btn", n_clicks=0,
+                    style={"background":ac,"color":"#080b12" if is_long else "white",
+                           "border":"none","borderRadius":"6px","padding":"10px 28px",
+                           "cursor":"pointer","fontWeight":"900","fontSize":"15px",
+                           "marginLeft":"10px","whiteSpace":"nowrap"}),
+                html.Button("✕", id="ticket-cancel-btn", n_clicks=0,
+                    style={"background":"none","color":TEXT_DIM,"border":f"1px solid {BORDER}",
+                           "borderRadius":"6px","padding":"10px 14px","cursor":"pointer",
+                           "fontSize":"14px","marginLeft":"8px"}),
+            ], style={"display":"flex","alignItems":"center"}),
+
+            html.Div(id="ticket-status",
+                style={"color":TEXT_DIM,"fontSize":"11px","marginTop":"8px","textAlign":"center"}),
+            dcc.Store(id="ticket-data", data=pending),
+        ], style={"background":BG_CARD,"border":f"2px solid {ac}40","borderLeft":f"4px solid {ac}",
+                  "borderRadius":"10px","padding":"20px","marginBottom":"20px"})
+    else:
+        ticket = html.Div([dcc.Store(id="ticket-data", data=None)])
+
+    # ── P&L strip ──
+    bar_w = f"{target_pct:.0f}%"
+    bar_color = pc(today_pnl)
+    pnl_strip = html.Div([
+        # Left: today with progress bar
+        html.Div([
+            html.Div([
+                html.Span("TODAY  ", style={"fontSize":"10px","color":TEXT_DIM,"textTransform":"uppercase"}),
+                html.Span(pf(today_pnl), style={"fontSize":"22px","fontWeight":"900","color":pc(today_pnl),"marginRight":"8px"}),
+                html.Span(f"/ ${daily_target:,.0f} target", style={"fontSize":"11px","color":TEXT_DIM}),
+                html.Span(" 🎯" if target_hit else "", style={"fontSize":"14px","marginLeft":"4px"}),
+            ], style={"marginBottom":"6px"}),
+            html.Div([
+                html.Div(style={"width":bar_w,"height":"4px","background":bar_color,
+                    "borderRadius":"2px"}),
+            ], style={"background":BG_DEEP,"borderRadius":"2px","height":"4px","marginBottom":"4px"}),
+        ], style={"flex":"2","paddingRight":"20px","borderRight":f"1px solid {BORDER}"}),
+        # Right: week / month / all time
+        *[html.Div([
+            html.Div(label, style={"fontSize":"10px","color":TEXT_DIM,"textTransform":"uppercase","marginBottom":"3px"}),
+            html.Div(pf(val), style={"fontSize":"16px","fontWeight":"700","color":pc(val)}),
+        ], style={"flex":"1","textAlign":"center"})
+        for label, val in [("Week", week_pnl), ("Month", month_pnl), ("All Time", tally["total"])]],
+        # Settings gear
+        html.Div([
+            html.Div("Daily Target", style={"fontSize":"9px","color":TEXT_DIM,"marginBottom":"4px"}),
+            html.Div([
+                dcc.Input(id="daily-target-input", type="number", value=daily_target,
+                    min=0, step=50,
+                    style={"background":BG_DEEP,"color":TEXT_PRI,"border":f"1px solid {BORDER}",
+                           "borderRadius":"4px 0 0 4px","padding":"4px 8px",
+                           "fontSize":"13px","width":"70px","outline":"none"}),
+                html.Button("Set", id="set-target-btn", n_clicks=0,
+                    style={"background":ACCENT,"color":"white","border":"none",
+                           "borderRadius":"0 4px 4px 0","padding":"4px 8px",
+                           "cursor":"pointer","fontSize":"12px","fontWeight":"700"}),
+            ], style={"display":"flex"}),
+            html.Span(id="target-status", style={"fontSize":"10px","color":TEXT_DIM}),
+        ], style={"flex":"1","textAlign":"center"}),
+    ], style={"display":"flex","alignItems":"center","gap":"16px","background":BG_CARD,
+              "borderRadius":"10px","padding":"14px 20px","marginBottom":"16px"})
+
+    # ── Open positions — compact blotter style ──
+    open_section_rows = []
     for t in open_trades:
         ticker     = t["ticker"]
-        live_price = live.get(ticker) or t["entry_price"]
+        live_price = live.get(ticker) or get_live_price_snapshot().get(ticker) or t["entry_price"]
         entry      = t["entry_price"]
         shares     = t["shares"]
         stop       = t["stop_price"]
         direction  = t["direction"]
-        if direction == "long":
+        atr        = t.get("atr") or abs(entry - stop) / 2
+        is_long    = direction == "long"
+
+        if is_long:
             upnl     = (live_price - entry) * shares
             upnl_pct = (live_price / entry - 1) * 100
+            risk_pct_live = (live_price - stop) / entry * 100
+            # Trailing stop hint
+            if atr and live_price >= entry + 2 * atr:
+                trail_hint = f"Move stop → ${entry + atr:,.2f}"
+                trail_color = "#00e676"
+            elif atr and live_price >= entry + atr:
+                trail_hint = f"Move stop → ${entry:,.2f} (breakeven)"
+                trail_color = "#f57c00"
+            else:
+                trail_hint = None
+                trail_color = TEXT_DIM
         else:
             upnl     = (entry - live_price) * shares
             upnl_pct = (entry / live_price - 1) * 100
-        pnl_color = "#00e676" if upnl >= 0 else "#ff1744"
-        days_held = (date.today() - date.fromisoformat(t["entry_date"])).days
+            trail_hint = None
+            trail_color = TEXT_DIM
 
-        open_rows.append(html.Div([
-            # Header row — ticker, direction, close button
+        pnl_c     = pc(upnl)
+        days_held = (__import__("datetime").date.today() -
+                     __import__("datetime").date.fromisoformat(t["entry_date"])).days
+        dir_color = "#00e676" if is_long else "#ff1744"
+        dir_label = "▲ LONG" if is_long else "▼ SHORT"
+
+        open_section_rows.append(html.Div([
+            # Single compact row
             html.Div([
+                # Left: ticker + direction
                 html.Div([
-                    html.Span(ticker, style={"fontWeight":"700","color":TEXT_PRI,"fontSize":"15px","marginRight":"8px"}),
-                    html.Span("Buying" if direction=="long" else "Selling",
-                        style={"background":"#1a3a2a" if direction=="long" else "#3a1a1a",
-                        "color":"#00e676" if direction=="long" else "#ff1744",
-                        "fontSize":"10px","padding":"3px 10px","borderRadius":"4px","fontWeight":"700","marginRight":"8px"}),
-                    html.Span(f"conv:{t['conviction']}", style={"color":TEXT_DIM,"fontSize":"11px"}),
-                    html.Span(f"  ·  Day {days_held}", style={"color":TEXT_DIM,"fontSize":"11px"}),
+                    html.Span(ticker, style={"fontSize":"16px","fontWeight":"900",
+                        "color":TEXT_PRI,"marginRight":"8px"}),
+                    html.Span(dir_label, style={"fontSize":"10px","fontWeight":"700",
+                        "color":dir_color,"marginRight":"12px"}),
+                    html.Span(f"Day {days_held}", style={"fontSize":"11px","color":TEXT_DIM}),
+                ], style={"display":"flex","alignItems":"center","flex":"1"}),
+
+                # Middle: price data
+                html.Div([
+                    html.Div([
+                        html.Span("Entry ", style={"fontSize":"10px","color":TEXT_DIM}),
+                        html.Span(fmt_price(entry,ticker),
+                            style={"fontSize":"14px","fontWeight":"700","color":TEXT_PRI}),
+                    ], style={"textAlign":"center","marginRight":"20px"}),
+                    html.Div([
+                        html.Span("Live ", style={"fontSize":"10px","color":TEXT_DIM}),
+                        html.Span(fmt_price(live_price,ticker),
+                            style={"fontSize":"14px","fontWeight":"700","color":pnl_c}),
+                    ], style={"textAlign":"center","marginRight":"20px"}),
+                    html.Div([
+                        html.Span("Stop ", style={"fontSize":"10px","color":TEXT_DIM}),
+                        html.Span(fmt_price(stop,ticker),
+                            style={"fontSize":"14px","fontWeight":"700","color":"#ef5350"}),
+                    ], style={"textAlign":"center","marginRight":"20px"}),
+                    html.Div([
+                        html.Span(f"{shares:,.0f} shares", style={"fontSize":"10px","color":TEXT_DIM}),
+                    ], style={"textAlign":"center","marginRight":"20px"}),
                 ], style={"display":"flex","alignItems":"center"}),
-                html.Button("✕ Close",
-                    id={"type":"close-paper-trade","trade_id":t["id"]},
-                    n_clicks=0,
-                    style={"background":"none","border":f"1px solid #ef535050","color":"#ef5350",
-                           "borderRadius":"6px","padding":"4px 10px","cursor":"pointer",
-                           "fontSize":"11px","fontWeight":"600"}),
-            ], style={"display":"flex","justifyContent":"space-between","alignItems":"center","marginBottom":"12px"}),
 
-            # Price row
-            html.Div([
+                # Right: P&L + close
                 html.Div([
-                    html.Div("Entry Price", style={"fontSize":"9px","color":TEXT_DIM,"marginBottom":"3px","textTransform":"uppercase"}),
-                    html.Div(fmt_price(entry,ticker), style={"fontSize":"15px","fontWeight":"700","color":TEXT_PRI}),
-                ], style={"background":BG_DEEP,"borderRadius":"6px","padding":"10px","textAlign":"center","flex":"1"}),
-                html.Div([
-                    html.Div("Live Price", style={"fontSize":"9px","color":TEXT_DIM,"marginBottom":"3px","textTransform":"uppercase"}),
-                    html.Div(fmt_price(live_price,ticker), style={"fontSize":"15px","fontWeight":"700","color":pnl_color}),
-                ], style={"background":BG_DEEP,"borderRadius":"6px","padding":"10px","textAlign":"center","flex":"1"}),
-                html.Div([
-                    html.Div("Stop Price", style={"fontSize":"9px","color":TEXT_DIM,"marginBottom":"3px","textTransform":"uppercase"}),
-                    html.Div(fmt_price(stop,ticker), style={"fontSize":"15px","fontWeight":"700","color":"#ef5350"}),
-                ], style={"background":BG_DEEP,"borderRadius":"6px","padding":"10px","textAlign":"center","flex":"1"}),
-            ], style={"display":"flex","gap":"8px","marginBottom":"8px"}),
+                    html.Div([
+                        html.Span(pf(upnl), style={"fontSize":"18px","fontWeight":"900","color":pnl_c}),
+                        html.Span(f"  {upnl_pct:+.1f}%",
+                            style={"fontSize":"12px","color":pnl_c,"marginLeft":"4px"}),
+                    ], style={"marginRight":"16px"}),
+                    html.Button("Close",
+                        id={"type":"close-paper-trade","trade_id":t["id"]},
+                        n_clicks=0,
+                        style={"background":"#3a1010","border":"1px solid #ef535060",
+                               "color":"#ef5350","borderRadius":"6px","padding":"6px 14px",
+                               "cursor":"pointer","fontSize":"12px","fontWeight":"700"}),
+                ], style={"display":"flex","alignItems":"center"}),
+            ], style={"display":"flex","alignItems":"center","justifyContent":"space-between"}),
 
-            # P&L row — clearly labelled
-            html.Div([
-                html.Span("Unrealised P&L  ", style={"color":TEXT_DIM,"fontSize":"12px"}),
-                html.Span(f"{'+'if upnl>=0 else ''}{upnl:,.2f}",
-                    style={"fontSize":"20px","fontWeight":"900","color":pnl_color,"marginRight":"8px"}),
-                html.Span(f"({upnl_pct:+.1f}%)",
-                    style={"fontSize":"14px","fontWeight":"600","color":pnl_color}),
-                html.Span(f"  ·  {shares:,.1f} shares  ·  Position: {fmt_price(entry*shares,ticker)}",
-                    style={"color":TEXT_DIM,"fontSize":"11px","marginLeft":"8px"}),
-            ], style={"display":"flex","alignItems":"center","padding":"8px 0","borderTop":f"1px solid {BORDER}"}),
+            # Trailing stop hint (only shown when relevant)
+            html.Div(f"🔒 {trail_hint}",
+                style={"fontSize":"11px","color":trail_color,"fontWeight":"600",
+                       "marginTop":"6px","paddingTop":"6px",
+                       "borderTop":f"1px solid {BORDER}"}) if trail_hint else html.Div(),
 
-        ], style={"background":BG_CARD,"border":f"1px solid #00e67630","borderLeft":"3px solid #00e676",
-            "borderRadius":"8px","padding":"14px","marginBottom":"10px"}))
+        ], style={"background":BG_CARD,
+                  "borderLeft":f"4px solid {pnl_c}",
+                  "borderRadius":"8px","padding":"12px 16px","marginBottom":"6px"}))
 
-    # ── Closed trades ──
-    def clean_exit(reason: str) -> str:
-        if not reason: return "—"
-        r = reason.lower()
-        if "stop hit" in r:      return "🛑 Price hit stop loss"
-        if "stage collapsed" in r or "stage collapse" in r: return "📉 Regime ended"
-        if "time stop" in r:     return "⏱ 10-day limit reached"
-        if "manually" in r:      return "👤 Manually closed"
-        if "end of period" in r: return "⏹ Period ended"
-        return reason[:30]
+    # ── Stats bar ──
+    stats_bar = html.Div()
+    if scorecard["closed"] > 0:
+        pf_str = f"{scorecard['profit_factor']}" if scorecard["profit_factor"] else "—"
+        stats_bar = html.Div([
+            *[html.Div([
+                html.Div(label, style={"fontSize":"9px","color":TEXT_DIM,"textTransform":"uppercase","marginBottom":"2px"}),
+                html.Div(val, style={"fontSize":"13px","fontWeight":"700","color":TEXT_PRI}),
+            ], style={"textAlign":"center"})
+            for label, val in [
+                ("Closed", str(scorecard["closed"])),
+                ("Open",   str(scorecard["open"])),
+                ("Win Rate", f"{scorecard['win_rate']}%"),
+                ("Profit Factor", pf_str),
+                ("Avg Return", f"{scorecard['mean_pct']:+.2f}%"),
+            ]],
+        ], style={"display":"flex","justifyContent":"space-around","background":BG_DEEP,
+                  "borderRadius":"8px","padding":"10px","marginBottom":"12px"})
+
+    # ── Closed trades — compact table ──
+    def clean_exit(r):
+        if not r: return "—"
+        rl = r.lower()
+        if "stop" in rl:    return "🛑 Stop"
+        if "stage" in rl:   return "📉 Regime"
+        if "time" in rl:    return "⏱ Time"
+        if "manual" in rl:  return "👤 Manual"
+        return r[:20]
+
+    th_s = {"padding":"6px 10px","color":TEXT_DIM,"fontSize":"10px","textTransform":"uppercase",
+            "fontWeight":"700","borderBottom":f"1px solid {BORDER}","background":BG_DEEP}
 
     closed_rows = []
-    for t in closed_trades[:20]:
-        pnl   = t.get("pnl") or 0
-        pct   = t.get("pnl_pct") or 0
-        color = "#00e676" if pnl >= 0 else "#ff1744"
-        result= "✅" if pnl >= 0 else "❌"
-        dir_label = "Buying" if t["direction"] == "long" else "Selling"
+    for t in closed_trades[:50]:
+        pnl = t.get("pnl") or 0
+        pct = t.get("pnl_pct") or 0
+        bc  = "#00e676" if pnl >= 0 else "#ff1744"
         closed_rows.append(html.Tr([
-            html.Td(t["entry_date"], style={"padding":"8px","color":TEXT_DIM,"fontSize":"12px"}),
-            html.Td(t["ticker"],     style={"padding":"8px","color":TEXT_PRI,"fontWeight":"700","fontSize":"12px"}),
-            html.Td(dir_label,       style={"padding":"8px","color":TEXT_SEC,"fontSize":"11px"}),
-            html.Td(str(t["conviction"]), style={"padding":"8px","color":TEXT_DIM,"fontSize":"11px"}),
-            html.Td(fmt_price(t["entry_price"],t["ticker"]), style={"padding":"8px","color":TEXT_PRI,"fontSize":"12px"}),
-            html.Td(fmt_price(t.get("exit_price"),t["ticker"]), style={"padding":"8px","color":TEXT_PRI,"fontSize":"12px"}),
-            html.Td(f"{'+'if pnl>=0 else ''}{pnl:,.2f}", style={"padding":"8px","color":color,"fontWeight":"700","fontSize":"12px"}),
-            html.Td(f"{pct:+.1f}%", style={"padding":"8px","color":color,"fontSize":"12px"}),
-            html.Td(f"{result} {clean_exit(t.get('exit_reason',''))}", style={"padding":"8px","color":TEXT_DIM,"fontSize":"11px"}),
+            html.Td(t.get("exit_date","—")[-5:],
+                style={"padding":"6px 10px","color":TEXT_DIM,"fontSize":"11px"}),
+            html.Td(t["ticker"],
+                style={"padding":"6px 10px","color":TEXT_PRI,"fontWeight":"700","fontSize":"12px"}),
+            html.Td("▲" if t["direction"]=="long" else "▼",
+                style={"padding":"6px 10px","color":"#00e676" if t["direction"]=="long" else "#ff1744",
+                       "fontSize":"13px","fontWeight":"900","textAlign":"center"}),
+            html.Td(fmt_price(t["entry_price"],t["ticker"]),
+                style={"padding":"6px 10px","color":TEXT_DIM,"fontSize":"11px","textAlign":"right"}),
+            html.Td(fmt_price(t.get("exit_price"),t["ticker"]),
+                style={"padding":"6px 10px","color":TEXT_PRI,"fontSize":"11px","textAlign":"right"}),
+            html.Td(f"{pf(pnl)}", style={"padding":"6px 10px","color":bc,"fontWeight":"700",
+                "fontSize":"12px","textAlign":"right"}),
+            html.Td(f"{pct:+.1f}%", style={"padding":"6px 10px","color":bc,"fontSize":"11px","textAlign":"right"}),
+            html.Td(clean_exit(t.get("exit_reason","")),
+                style={"padding":"6px 10px","color":TEXT_DIM,"fontSize":"10px"}),
         ], style={"borderBottom":f"1px solid {BORDER}"}))
 
-    th_s = {"padding":"8px","color":TEXT_DIM,"fontSize":"10px","textTransform":"uppercase",
-            "fontWeight":"700","borderBottom":f"1px solid {BORDER}","textAlign":"left"}
-
     return html.Div([
-        html.Div("📝 Paper Trading", style={"fontSize":"18px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"4px"}),
-        html.Div("Simulated trades using 15-min delayed prices. Enter trades from the 🚨 Alerts tab or any asset card.",
-            style={"color":TEXT_DIM,"fontSize":"12px","marginBottom":"24px"}),
-
-        # Trade ticket — shown when a pending trade is waiting for confirmation
         ticket,
-
-        # Scorecard
-        html.Div(sc_cards, style={"display":"flex","gap":"10px","marginBottom":"24px","flexWrap":"wrap"}),
+        pnl_strip,
 
         # Open positions
         html.Div([
-            html.Div(f"📈 Open Positions ({len(open_trades)})",
-                style={"fontSize":"14px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"12px"}),
-            *(open_rows if open_rows else [
-                html.Div("No open paper trades. Enter a trade from the Alerts tab when a signal fires.",
-                    style={"color":TEXT_DIM,"fontSize":"13px","fontStyle":"italic","padding":"16px 0"})
+            html.Div(f"Open  {len(open_trades)}",
+                style={"fontSize":"13px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"10px"}),
+            *(open_section_rows if open_section_rows else [
+                html.Div("No open trades — signals appear in 🚨 Alerts",
+                    style={"color":TEXT_DIM,"fontSize":"13px","fontStyle":"italic","padding":"16px 0",
+                           "textAlign":"center"})
             ]),
-        ], style={"background":BG_CARD,"borderRadius":"10px","padding":"20px","marginBottom":"20px"}),
+        ], style={"marginBottom":"16px"}),
+
+        stats_bar,
 
         # Closed trades
         html.Div([
-            html.Div(f"📋 Closed Trades ({len(closed_trades)})",
-                style={"fontSize":"14px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"12px"}),
-            html.Table([
-                html.Tr([html.Th(c, style=th_s) for c in ["Date","Ticker","Dir","Conv","Entry","Exit","P&L","%","Reason"]]),
-                *(closed_rows if closed_rows else [
-                    html.Tr([html.Td("No closed trades yet",
-                        style={"padding":"20px","color":TEXT_DIM,"textAlign":"center","fontStyle":"italic"})])
-                ])
-            ], style={"width":"100%","borderCollapse":"collapse"}),
-        ], style={"background":BG_CARD,"borderRadius":"10px","padding":"20px"}),
+            html.Div(f"History  {len(closed_trades)} trades",
+                style={"fontSize":"13px","fontWeight":"700","color":TEXT_PRI,"marginBottom":"10px"}),
+            html.Div([
+                html.Table([
+                    html.Thead(html.Tr([html.Th(c, style=th_s)
+                        for c in ["Date","Ticker","","Entry","Exit","P&L","%","Exit Reason"]])),
+                    html.Tbody(closed_rows if closed_rows else [
+                        html.Tr([html.Td("No closed trades yet",
+                            style={"padding":"20px","color":TEXT_DIM,"textAlign":"center",
+                                   "fontStyle":"italic"})])
+                    ]),
+                ], style={"width":"100%","borderCollapse":"collapse"}),
+            ], style={"overflowX":"auto"}),
+        ], style={"background":BG_CARD,"borderRadius":"10px","padding":"16px 20px"}),
     ])
+
 
 def _alert_page_html(sig: dict) -> str:
     """Generate a self-contained HTML alert page for one trade signal."""
@@ -2169,6 +3434,128 @@ def build_alerts_tab(entry_signals: list[dict], exit_signals: list[dict]) -> htm
 
 
 # ---------------------------------------------------------------------------
+# Nightly scan callbacks
+# ---------------------------------------------------------------------------
+
+@app.callback(
+    Output("tab-content","children", allow_duplicate=True),
+    Output("all-rows","data", allow_duplicate=True),
+    Output("bucket-row","children", allow_duplicate=True),
+    Input({"type":"nightly-add","ticker":ALL,"name":ALL},"n_clicks"),
+    prevent_initial_call=True,
+)
+def nightly_add_to_grid(n_clicks_list):
+    """Add a single nightly signal, scan it immediately, refresh grid."""
+    if not ctx.triggered or not any(v for v in n_clicks_list if v):
+        raise PreventUpdate
+    tid = ctx.triggered_id
+    if not tid or not isinstance(tid, dict): raise PreventUpdate
+    ticker = tid.get("ticker","")
+    name   = tid.get("name", ticker)
+    if not ticker: raise PreventUpdate
+    # Add to watchlist and scan immediately so it appears on grid now
+    add_custom_ticker(ticker, name)
+    try:
+        run_scan([ticker])
+    except Exception:
+        pass
+    # Reload all rows so grid updates without needing Scan All
+    rows = load_latest()
+    if rows:
+        for r in rows: r["conviction"] = conviction_score(r)
+    return build_nightly_tab(), rows, bucket_summary(rows)
+
+
+@app.callback(
+    Output("nightly-promote-status","children"),
+    Output("tab-content","children", allow_duplicate=True),
+    Output("all-rows","data", allow_duplicate=True),
+    Output("bucket-row","children", allow_duplicate=True),
+    Input("nightly-promote-all-btn","n_clicks"),
+    prevent_initial_call=True,
+)
+def nightly_promote_all(n):
+    if not n: raise PreventUpdate
+    best = load_nightly_best(min_stage=4, min_conviction=50, limit=30)
+    wl   = get_full_watchlist()
+    added = []
+    for r in best:
+        if r["ticker"] not in wl:
+            name = NAME_MAP.get(r["ticker"], r["ticker"])
+            add_custom_ticker(r["ticker"], name)
+            added.append(r["ticker"])
+    if added:
+        try:
+            run_scan(added)
+        except Exception:
+            pass
+        status = f"✅ Added {len(added)} to grid: {', '.join(added)}"
+    else:
+        status = "ℹ️ All candidates already on grid"
+    rows = load_latest()
+    if rows:
+        for r in rows: r["conviction"] = conviction_score(r)
+    return status, build_nightly_tab(), rows, bucket_summary(rows)
+
+# ---------------------------------------------------------------------------
+# Nightly scan callbacks
+# ---------------------------------------------------------------------------
+
+@app.callback(
+    Output("nightly-scan-status","children"),
+    Output("tab-content","children", allow_duplicate=True),
+    Input("nightly-scan-btn","n_clicks"),
+    Input("nightly-tsx-btn","n_clicks"),
+    Input("nightly-nyse-btn","n_clicks"),
+    Input("nightly-crypto-btn","n_clicks"),
+    prevent_initial_call=True,
+)
+def trigger_nightly_scan(full, tsx, nyse, crypto):
+    if not any([full, tsx, nyse, crypto]):
+        raise PreventUpdate
+    triggered = ctx.triggered_id
+    markets = {
+        "nightly-scan-btn":   ["tsx","nyse","crypto"],
+        "nightly-tsx-btn":    ["tsx"],
+        "nightly-nyse-btn":   ["nyse"],
+        "nightly-crypto-btn": ["crypto"],
+    }.get(triggered, ["tsx","nyse","crypto"])
+    labels = {"tsx":"🍁 TSX","nyse":"🇺🇸 US","crypto":"₿ Crypto"}
+    running = " + ".join(labels[m] for m in markets)
+    try:
+        summary = run_nightly_scan(markets=markets)
+        status  = (f"✅ Done — {summary['total']} scanned · "
+                   f"{summary['signals']} signals · "
+                   f"TSX:{summary['tsx']} US:{summary['nyse']} Crypto:{summary['crypto']}")
+    except Exception as e:
+        status = f"❌ Scan error: {str(e)[:60]}"
+    return status, build_nightly_tab()
+
+
+# ---------------------------------------------------------------------------
+# Paper tab — profit target callback
+# ---------------------------------------------------------------------------
+
+@app.callback(
+    Output("target-status","children"),
+    Output("tab-content","children", allow_duplicate=True),
+    Input("set-target-btn","n_clicks"),
+    State("daily-target-input","value"),
+    prevent_initial_call=True,
+)
+def save_daily_target(n, value):
+    if not n or value is None:
+        raise PreventUpdate
+    try:
+        v = float(value)
+        if v < 0:
+            return "❌ Target must be positive", dash.no_update
+        set_daily_target(v)
+        return f"✅ Target set to ${v:,.0f}", build_paper_tab(None)
+    except Exception as e:
+        return f"❌ {str(e)[:40]}", dash.no_update
+
+# ---------------------------------------------------------------------------
 # Alert callbacks
 # ---------------------------------------------------------------------------
 
@@ -2182,13 +3569,15 @@ def update_alert_signals(rows, live_prices):
     """Recompute entry + exit signals whenever rows or live prices update."""
     if not rows:
         return [], "🚨 Alerts"
-    if live_prices:
-        rows = [{**r,"price":live_prices[r["ticker"]]} if r["ticker"] in live_prices else r
+    # Fall back to in-process cache if Dash store is still empty (cold-start)
+    effective_prices = live_prices or get_live_price_snapshot()
+    if effective_prices:
+        rows = [{**r,"price":effective_prices[r["ticker"]]} if r["ticker"] in effective_prices else r
                 for r in rows]
     portfolio    = get_portfolio_value()
     entry_sigs   = get_entry_signals(rows, portfolio)
     open_trades  = load_open_trades()
-    exit_sigs    = check_exit_signals(open_trades, rows, live_prices or {})
+    exit_sigs    = check_exit_signals(open_trades, rows, effective_prices or {})
     _set_alert_signals(entry_sigs)
     total = len(entry_sigs) + len(exit_sigs)
     label = f"🚨 Alerts  ●{total}●" if total > 0 else "🚨 Alerts"

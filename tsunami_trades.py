@@ -388,7 +388,15 @@ def get_entry_signals(rows: list[dict], portfolio: float = DEFAULT_PORT) -> list
     """
     Filter scan results to valid entry signals.
     Stage 3+ AND conviction >= 65 AND direction confirmed.
+    Suppresses GET IN alerts for tickers already in an open paper trade.
     """
+    # Don't re-alert on tickers we're already holding
+    try:
+        open_paper = load_open_paper_trades()
+        already_in = {t["ticker"] for t in open_paper}
+    except Exception:
+        already_in = set()
+
     signals = []
     for r in rows:
         stage     = r.get("stage", 0)
@@ -401,6 +409,9 @@ def get_entry_signals(rows: list[dict], portfolio: float = DEFAULT_PORT) -> list
         if conviction < MIN_CONVICTION:
             continue
         if signal not in {"bullish_breakout_bias", "bearish_breakout_bias"}:
+            continue
+        # Already in this trade — show nothing until it's closed
+        if r.get("ticker") in already_in:
             continue
 
         ticker    = r["ticker"]
@@ -636,4 +647,137 @@ def paper_trade_scorecard() -> dict:
         "total_pnl":     round(sum(pnls), 2),
         "profit_factor": pf,
         "mean_pct":      round(sum(pcts) / len(pcts), 2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Questrade accounts
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Questrade accounts — add your own accounts here
+# Format: account_id -> label, account number, type, and holdings
+# ---------------------------------------------------------------------------
+QUESTRADE_ACCOUNTS = {
+    # "my_tfsa": {
+    #     "label":   "My TFSA",
+    #     "account": "12345678",   # your Questrade account number
+    #     "owner":   "Your Name",
+    #     "type":    "TFSA",       # TFSA, RRSP, Margin, etc.
+    #     "holdings": [
+    #         {"symbol": "AAPL",  "name": "Apple",  "qty": 10, "avg_price": 150.00, "currency": "USD"},
+    #         {"symbol": "RY.TO", "name": "Royal Bank", "qty": 25, "avg_price": 130.00, "currency": "CAD"},
+    #     ],
+    # },
+}
+
+def get_questrade_accounts() -> dict:
+    return QUESTRADE_ACCOUNTS
+
+def load_questrade_holdings(account_id: str) -> list[dict]:
+    """Load holdings for a Questrade account, with DB override support."""
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=30)
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS questrade_holdings (
+                account_id TEXT, symbol TEXT, name TEXT,
+                qty REAL, avg_price REAL, currency TEXT,
+                updated_date TEXT,
+                PRIMARY KEY (account_id, symbol)
+            )
+        """)
+        cur.execute("SELECT * FROM questrade_holdings WHERE account_id=?", (account_id,))
+        rows = [dict(r) for r in cur.fetchall()]
+        con.close()
+        if rows:
+            return rows
+    except Exception:
+        pass
+    return QUESTRADE_ACCOUNTS.get(account_id, {}).get("holdings", [])
+
+def save_questrade_holdings(account_id: str, holdings: list[dict]) -> None:
+    """Save updated holdings to DB so manual edits persist."""
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS questrade_holdings (
+            account_id TEXT, symbol TEXT, name TEXT,
+            qty REAL, avg_price REAL, currency TEXT,
+            updated_date TEXT,
+            PRIMARY KEY (account_id, symbol)
+        )
+    """)
+    cur.execute("DELETE FROM questrade_holdings WHERE account_id=?", (account_id,))
+    for h in holdings:
+        cur.execute("""
+            INSERT OR REPLACE INTO questrade_holdings
+            (account_id, symbol, name, qty, avg_price, currency, updated_date)
+            VALUES (?,?,?,?,?,?,?)
+        """, (account_id, h["symbol"], h.get("name",""), h["qty"],
+              h["avg_price"], h.get("currency","CAD"), date.today().isoformat()))
+    con.commit()
+    con.close()
+
+
+def get_daily_target() -> float:
+    """Get the daily profit target (default $300)."""
+    init_trades_tables()
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    cur = con.cursor()
+    cur.execute("SELECT value FROM portfolio_config WHERE key='daily_target'")
+    row = cur.fetchone()
+    con.close()
+    return float(row[0]) if row else 300.0
+
+def set_daily_target(value: float) -> None:
+    init_trades_tables()
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    cur = con.cursor()
+    cur.execute("INSERT OR REPLACE INTO portfolio_config VALUES ('daily_target', ?)",
+                (str(value),))
+    con.commit()
+    con.close()
+
+
+def get_pnl_tally() -> dict:
+    """Compute realised P&L totals from closed paper trades."""
+    init_trades_tables()
+    from datetime import date, timedelta
+    today       = date.today()
+    week_start  = today - timedelta(days=today.weekday())
+    month_start = today.replace(day=1)
+
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute("""
+        SELECT exit_date, pnl, ticker, direction, pnl_pct
+        FROM paper_trades
+        WHERE status='closed' AND exit_date IS NOT NULL
+        ORDER BY exit_date DESC
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+
+    day_pnl   = sum(r["pnl"] or 0 for r in rows if r["exit_date"] == today.isoformat())
+    week_pnl  = sum(r["pnl"] or 0 for r in rows if r["exit_date"] >= week_start.isoformat())
+    month_pnl = sum(r["pnl"] or 0 for r in rows if r["exit_date"] >= month_start.isoformat())
+    total_pnl = sum(r["pnl"] or 0 for r in rows)
+
+    daily = {}
+    for r in rows:
+        d = r["exit_date"]
+        daily[d] = daily.get(d, 0.0) + (r["pnl"] or 0)
+
+    return {
+        "today":      round(day_pnl, 2),
+        "week":       round(week_pnl, 2),
+        "month":      round(month_pnl, 2),
+        "total":      round(total_pnl, 2),
+        "day_trades": [r for r in rows if r["exit_date"] == today.isoformat()],
+        "week_trades":[r for r in rows if r["exit_date"] >= week_start.isoformat()],
+        "all_trades": rows,
+        "daily":      {k: round(v, 2) for k, v in sorted(daily.items(), reverse=True)},
     }

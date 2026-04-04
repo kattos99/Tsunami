@@ -552,3 +552,333 @@ def run_tsx_scan() -> list[dict]:
 
     print(f"\n✅ TSX scan complete — {len(results)}/20 processed")
     return results
+
+
+# -----------------------------------------------------------------------
+# Nightly Full Universe Scan
+# -----------------------------------------------------------------------
+
+# Complete TSX60 + key large caps
+TSX_FULL = [
+    # Banks & Insurance
+    "RY.TO","TD.TO","BNS.TO","BMO.TO","CM.TO","NA.TO","MFC.TO","SLF.TO","IFC.TO","GWO.TO",
+    # Energy
+    "CNQ.TO","SU.TO","CVE.TO","IMO.TO","TOU.TO","ARX.TO","ERF.TO","MEG.TO","PEY.TO","TVE.TO",
+    "ENB.TO","TRP.TO","PPL.TO","KEY.TO","GEI.TO",
+    # Mining & Materials
+    "ABX.TO","AEM.TO","WPM.TO","FM.TO","TECK-B.TO","K.TO","AGI.TO","OR.TO","LUG.TO","EDR.TO",
+    "NTR.TO","MG.TO","ACO-X.TO","CCL-B.TO","IVN.TO",
+    # Tech & Growth
+    "SHOP.TO","CSU.TO","OTEX.TO","KXS.TO","BB.TO","LSPD.TO","NVEI.TO","DND.TO",
+    # Utilities
+    "FTS.TO","H.TO","EMA.TO","AQN.TO","BIP-UN.TO","BEP-UN.TO","INE.TO",
+    # Industrials & Transport
+    "CNR.TO","CP.TO","WCN.TO","TIH.TO","STN.TO","WSP.TO","ATRL.TO","TFI.TO",
+    # Consumer & Retail
+    "L.TO","MRU.TO","EMP-A.TO","DOL.TO","ATD.TO","QSR.TO","MTY.TO",
+    # REITs
+    "REI-UN.TO","CRT-UN.TO","AP-UN.TO","HR-UN.TO","SRU-UN.TO","DIR-UN.TO",
+    # Telecoms & Media
+    "T.TO","RCI-B.TO","BCE.TO","QBR-B.TO","MBT.TO",
+    # Financials & Other
+    "BN.TO","BAM.TO","X.TO","POW.TO","FFH.TO","CWB.TO",
+]
+
+# S&P 500 most liquid + key sectors (top ~150 by volume/relevance)
+NYSE_FULL = [
+    # Mega cap tech
+    "AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","NFLX","AMD","INTC",
+    "TSM","AVGO","QCOM","MU","AMAT","LRCX","KLAC","ASML","ARM","SMCI",
+    # Financials
+    "JPM","BAC","GS","MS","WFC","C","BLK","SCHW","AXP","V","MA","PYPL","COF","USB","TFC",
+    # Energy
+    "XOM","CVX","OXY","COP","EOG","PXD","SLB","HAL","MPC","PSX","VLO","DVN","FANG",
+    # Healthcare
+    "UNH","JNJ","PFE","ABBV","MRK","LLY","BMY","AMGN","GILD","REGN","BIIB","VRTX","ISRG",
+    # Consumer
+    "WMT","COST","TGT","HD","LOW","MCD","SBUX","NKE","LULU","TJX","ROST","DG","DLTR",
+    # Industrials
+    "GE","HON","MMM","CAT","DE","BA","RTX","LMT","NOC","GD","ITW","EMR","ETN","PH",
+    # Comms & Media
+    "DIS","CMCSA","CHTR","T","VZ","TMUS","PARA","WBD","SNAP","PINS","SPOT",
+    # High momentum / growth
+    "PLTR","COIN","MSTR","HOOD","SOFI","RBLX","U","DKNG","ABNB","UBER","LYFT",
+    "RIVN","LCID","NIO","XPEV","LI","F","GM",
+    # ETFs worth scanning
+    "SPY","QQQ","IWM","GLD","SLV","TLT","HYG","XLE","XLF","XLK","XLV","ARKK",
+    # Crypto-adjacent
+    "MARA","RIOT","HUT","BTBT","CLSK","CIFR",
+]
+
+# Full crypto — top 50 by market cap via CoinGecko symbols → Yahoo tickers
+CRYPTO_FULL_TICKERS = [
+    "BTC-USD","ETH-USD","BNB-USD","XRP-USD","SOL-USD","ADA-USD","DOGE-USD",
+    "AVAX-USD","SHIB-USD","DOT-USD","LINK-USD","MATIC-USD","LTC-USD","BCH-USD",
+    "UNI-USD","ATOM-USD","XLM-USD","ETC-USD","XMR-USD","ALGO-USD",
+    "FIL-USD","ICP-USD","APT-USD","ARB-USD","OP-USD","INJ-USD","SUI-USD",
+    "HBAR-USD","VET-USD","EGLD-USD","THETA-USD","NEAR-USD","AAVE-USD",
+    "GRT-USD","STX-USD","IMX-USD","SAND-USD","MANA-USD","CHZ-USD",
+    "CRO-USD","FTM-USD","GALA-USD","ENS-USD","CAKE-USD","COMP-USD",
+    "TWT-USD","SUSHI-USD","YFI-USD","SNX-USD","BAL-USD",
+]
+
+NIGHTLY_SCAN_DB = Path.home() / "Downloads" / "tsunami_nightly.db"
+
+def init_nightly_table() -> None:
+    con = sqlite3.connect(NIGHTLY_SCAN_DB, timeout=30)
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nightly_scans (
+            ticker      TEXT,
+            scan_date   TEXT,
+            market      TEXT,
+            name        TEXT,
+            price       REAL,
+            pct_5d      REAL,
+            pct_20d     REAL,
+            state       TEXT,
+            stage       INTEGER,
+            conviction  INTEGER,
+            compression REAL,
+            energy      REAL,
+            volume      REAL,
+            cwt_slope   REAL,
+            cwt_conc    REAL,
+            exc_reversal INTEGER,
+            PRIMARY KEY (ticker, scan_date)
+        )
+    """)
+    # Track when last nightly ran
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nightly_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    con.commit()
+    con.close()
+
+def save_nightly_result(row: dict) -> None:
+    con = sqlite3.connect(NIGHTLY_SCAN_DB, timeout=30)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO nightly_scans
+        (ticker,scan_date,market,name,price,pct_5d,pct_20d,state,stage,conviction,
+         compression,energy,volume,cwt_slope,cwt_conc,exc_reversal)
+        VALUES (:ticker,:scan_date,:market,:name,:price,:pct_5d,:pct_20d,:state,:stage,:conviction,
+                :compression,:energy,:volume,:cwt_slope,:cwt_conc,:exc_reversal)
+    """, row)
+    con.commit()
+    con.close()
+
+def load_nightly_best(min_stage: int = 2, min_conviction: int = 40,
+                      limit: int = 50) -> list[dict]:
+    """Load top signals from last nightly scan, sorted by conviction."""
+    init_nightly_table()
+    con = sqlite3.connect(NIGHTLY_SCAN_DB, timeout=30)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute("""
+        SELECT n.* FROM nightly_scans n
+        INNER JOIN (
+            SELECT ticker, MAX(scan_date) as max_date
+            FROM nightly_scans GROUP BY ticker
+        ) latest ON n.ticker=latest.ticker AND n.scan_date=latest.max_date
+        WHERE n.stage >= ? AND n.conviction >= ?
+        ORDER BY n.conviction DESC, n.stage DESC
+        LIMIT ?
+    """, (min_stage, min_conviction, limit))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
+
+def get_nightly_scan_date() -> str | None:
+    """Return the date of the last completed nightly scan."""
+    try:
+        init_nightly_table()
+        con = sqlite3.connect(NIGHTLY_SCAN_DB, timeout=30)
+        cur = con.cursor()
+        cur.execute("SELECT value FROM nightly_meta WHERE key='last_scan'")
+        row = cur.fetchone()
+        con.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+def run_nightly_scan(markets: list[str] | None = None) -> dict:
+    """
+    Full nightly scan — TSX, NYSE, Crypto.
+    Returns summary dict with counts per market.
+    Designed to run at midnight or on demand.
+    """
+    import time as _time
+    from tsunami_engine import run_pipeline, get_cfg, STATE_STAGE
+
+    if markets is None:
+        markets = ["tsx", "nyse", "crypto"]
+
+    init_nightly_table()
+    today    = date.today().isoformat()
+    summary  = {"tsx": 0, "nyse": 0, "crypto": 0, "total": 0, "signals": 0}
+
+    def _scan_ticker(ticker: str, market: str, name: str = "") -> dict | None:
+        """Scan a single ticker through the pipeline. Returns result or None."""
+        try:
+            end   = date.today()
+            start = end - timedelta(days=365 * 3)
+            raw   = yf.download(ticker, start=str(start), end=str(end),
+                                auto_adjust=True, progress=False, timeout=15)
+            if raw is None or raw.empty or len(raw) < 100:
+                return None
+            raw.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower()
+                           for c in raw.columns]
+            raw = raw.reset_index()
+            raw.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower()
+                           for c in raw.columns]
+            df = raw[["date","open","high","low","close","volume"]].dropna()
+            df = df.sort_values("date").reset_index(drop=True)
+
+            cfg = get_cfg(ticker)
+            out = run_pipeline(df, cfg)
+            row = out.iloc[-1]
+            state = str(row["market_state"])
+            stage = STATE_STAGE.get(state, 0)
+
+            # Quick conviction score
+            s = stage * 8
+            comp = row.get("compression_ratio")
+            if comp and float(comp) < 0.80: s += 15
+            elif comp and float(comp) < 0.95: s += 5
+            slope = row.get("cwt_cycle_slope")
+            if slope and float(slope) < -3: s += 15
+            elif slope and float(slope) < 0: s += 5
+            conc = row.get("cwt_conc_min_3") or row.get("cwt_energy_concentration")
+            if conc and float(conc) > 5: s += 10
+            if row.get("excursion_reversal"): s += 20
+            conviction = min(int(s), 100)
+
+            def fv(v):
+                try: f = float(v); return round(f, 6) if np.isfinite(f) else None
+                except: return None
+
+            pct_5d  = (float(out["close"].iloc[-1])/float(out["close"].iloc[-6])-1)*100  if len(out)>=6  else None
+            pct_20d = (float(out["close"].iloc[-1])/float(out["close"].iloc[-21])-1)*100 if len(out)>=21 else None
+
+            return {
+                "ticker": ticker, "scan_date": today, "market": market,
+                "name": name or ticker,
+                "price":       fv(row["close"]),
+                "pct_5d":      round(pct_5d, 2)  if pct_5d  is not None else None,
+                "pct_20d":     round(pct_20d, 2) if pct_20d is not None else None,
+                "state":       state, "stage": stage, "conviction": conviction,
+                "compression": fv(row.get("compression_ratio")),
+                "energy":      fv(row.get("energy_ratio")),
+                "volume":      fv(row.get("volume_ratio")),
+                "cwt_slope":   fv(row.get("cwt_cycle_slope")),
+                "cwt_conc":    fv(row.get("cwt_energy_concentration")),
+                "exc_reversal": int(bool(row.get("excursion_reversal", False))),
+            }
+        except Exception:
+            return None
+
+    # ── TSX ──
+    if "tsx" in markets:
+        print(f"\n🍁 Scanning TSX ({len(TSX_FULL)} stocks)...")
+        for ticker in TSX_FULL:
+            result = _scan_ticker(ticker, "tsx")
+            if result:
+                save_nightly_result(result)
+                summary["tsx"] += 1
+                if result["stage"] >= 2:
+                    summary["signals"] += 1
+                print(f"  {ticker:12} Stage {result['stage']} · {result['state']}")
+            _time.sleep(0.5)
+
+    # ── NYSE/NASDAQ ──
+    if "nyse" in markets:
+        print(f"\n🇺🇸 Scanning NYSE/NASDAQ ({len(NYSE_FULL)} stocks)...")
+        for ticker in NYSE_FULL:
+            result = _scan_ticker(ticker, "nyse")
+            if result:
+                save_nightly_result(result)
+                summary["nyse"] += 1
+                if result["stage"] >= 2:
+                    summary["signals"] += 1
+                print(f"  {ticker:12} Stage {result['stage']} · {result['state']}")
+            _time.sleep(0.5)
+
+    # ── Crypto ──
+    if "crypto" in markets:
+        print(f"\n₿ Scanning Crypto ({len(CRYPTO_FULL_TICKERS)} coins)...")
+        for ticker in CRYPTO_FULL_TICKERS:
+            result = _scan_ticker(ticker, "crypto")
+            if result:
+                save_nightly_result(result)
+                summary["crypto"] += 1
+                if result["stage"] >= 2:
+                    summary["signals"] += 1
+                print(f"  {ticker:16} Stage {result['stage']} · {result['state']}")
+            _time.sleep(0.3)
+
+    summary["total"] = summary["tsx"] + summary["nyse"] + summary["crypto"]
+
+    # Save completion timestamp
+    con = sqlite3.connect(NIGHTLY_SCAN_DB, timeout=30)
+    cur = con.cursor()
+    cur.execute("INSERT OR REPLACE INTO nightly_meta VALUES ('last_scan', ?)", (today,))
+    cur.execute("INSERT OR REPLACE INTO nightly_meta VALUES ('last_summary', ?)",
+                (str(summary),))
+    con.commit()
+    con.close()
+
+    print(f"\n✅ Nightly scan complete: {summary['total']} scanned · {summary['signals']} signals")
+    return summary
+
+
+def _nightly_scheduler() -> None:
+    """
+    Background thread — waits until midnight then runs full nightly scan.
+    Checks every minute if it's time to run.
+    Also runs immediately on first start if today's scan hasn't been done.
+    """
+    import time as _time
+    from datetime import datetime
+
+    last_ran = get_nightly_scan_date()
+    today    = date.today().isoformat()
+
+    # Run immediately if no scan today yet and it's after midnight
+    if last_ran != today:
+        now = datetime.now()
+        # Only auto-run at startup if it's between midnight and 6am
+        if 0 <= now.hour < 6:
+            print("🌙 Running missed nightly scan...")
+            try:
+                run_nightly_scan()
+            except Exception as e:
+                print(f"  Nightly scan error: {e}")
+
+    while True:
+        _time.sleep(60)  # check every minute
+        now  = datetime.now()
+        today = date.today().isoformat()
+        # Fire at midnight (00:00 - 00:02 window)
+        if now.hour == 0 and now.minute < 3 and get_nightly_scan_date() != today:
+            print("🌙 Midnight — starting nightly scan...")
+            try:
+                run_nightly_scan()
+            except Exception as e:
+                print(f"  Nightly scan error: {e}")
+
+
+_nightly_thread_started = False
+
+def start_nightly_scheduler() -> None:
+    """Start the midnight scheduler in a background daemon thread."""
+    global _nightly_thread_started
+    if not _nightly_thread_started:
+        import threading
+        t = threading.Thread(target=_nightly_scheduler, daemon=True, name="tsunami-nightly")
+        t.start()
+        _nightly_thread_started = True
+        print("🌙 Nightly scheduler started — full scan runs at midnight")

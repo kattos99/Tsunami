@@ -27,6 +27,56 @@ REQUIRED = [
 ]
 
 
+CONFIG_PATH = Path.home() / ".claude_config.json"
+
+
+def setup_api_key() -> None:
+    """
+    Ensure an Anthropic API key is saved for AI commentary.
+    - If already saved, do nothing.
+    - If ANTHROPIC_API_KEY env var is set, save it and move on.
+    - Otherwise, prompt the user to paste it in.
+    Skippable — pressing Enter with no input disables AI commentary.
+    """
+    import json, os
+
+    # Already saved?
+    if CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+            if cfg.get("anthropic_api_key", "").startswith("sk-"):
+                print("  ✅ Anthropic API key loaded")
+                return
+        except Exception:
+            pass
+
+    # Env var?
+    env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if env_key.startswith("sk-"):
+        CONFIG_PATH.write_text(json.dumps({"anthropic_api_key": env_key}, indent=2))
+        print("  ✅ Anthropic API key saved from environment")
+        return
+
+    # Prompt
+    print("\n  🔑 Anthropic API key not found.")
+    print("     AI commentary in the Intelligence tab needs it.")
+    print("     Get yours at: https://console.anthropic.com/settings/keys")
+    print("     (Press Enter to skip — AI commentary will be disabled)\n")
+    try:
+        key = input("  Paste your API key here: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        key = ""
+
+    if key.startswith("sk-"):
+        CONFIG_PATH.write_text(json.dumps({"anthropic_api_key": key}, indent=2))
+        print("  ✅ API key saved to ~/.claude_config.json\n")
+    else:
+        if key:
+            print("  ⚠️  That doesn't look like a valid key (should start with sk-). Skipping.\n")
+        else:
+            print("  ℹ️  Skipped — AI commentary disabled. Run again to add your key later.\n")
+
+
 def install_deps() -> None:
     print("Checking dependencies...")
     for pkg in REQUIRED:
@@ -62,6 +112,9 @@ def main() -> None:
     if not args.no_install:
         install_deps()
         print()
+
+    print("Checking API key...")
+    setup_api_key()
 
     from tsunami_engine import init_db, load_latest, run_scan
 
